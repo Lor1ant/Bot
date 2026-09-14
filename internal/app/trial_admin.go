@@ -1,0 +1,446 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"time"
+
+	"github.com/go-telegram/bot/models"
+
+	"remnabot/internal/i18n"
+	"remnabot/internal/model"
+	"remnabot/internal/remnawave"
+)
+
+func (a *App) trialCfg() (enabled bool, days, gb, hwid int, intSq []string, extSq string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg == nil {
+		return
+	}
+	t := a.botCfg.Trial
+	return t.Enabled, t.Days, t.TrafficGB, t.DeviceLimit, append([]string(nil), t.InternalSquads...), t.ExternalSquadUUID
+}
+
+func (a *App) showTrialAdmin(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	enabled, days, gb, hwid, intSq, extSq := a.trialCfg()
+	statusKey := "admin.off"
+	if enabled {
+		statusKey = "admin.on"
+	}
+	gbStr := i18n.T(lang, "trial.unlimited")
+	if gb > 0 {
+		gbStr = strconv.Itoa(gb) + " GB"
+	}
+	hwidStr := i18n.T(lang, "pricing.hwid_default")
+	if hwid > 0 {
+		hwidStr = strconv.Itoa(hwid)
+	}
+	internalCSV, externalName := a.squadNames(ctx, intSq, extSq)
+	a.mu.Lock()
+	strat := ""
+	allowBuy := false
+	var reset model.TrialConfig
+	if a.botCfg != nil {
+		strat = a.botCfg.Trial.Strategy
+		allowBuy = a.botCfg.Trial.AllowBuy
+		reset = a.botCfg.Trial
+	}
+	a.mu.Unlock()
+	stratStr := i18n.T(lang, "trial.strat_inherit")
+	if model.ValidStrategy(strat) {
+		stratStr = strat
+	}
+	buyKey := "admin.off"
+	if allowBuy {
+		buyKey = "admin.on"
+	}
+	resetStr := i18n.T(lang, "trial.reset_off")
+	if reset.ResetUnused && reset.ResetUnusedMax > 0 {
+		resetStr = i18n.T(lang, "trial.reset_on", reset.ResetUnusedMax, reset.ResetUnusedPct)
+	}
+	body := i18n.T(lang, "trial.title",
+		i18n.T(lang, statusKey), days, gbStr, hwidStr, stratStr, i18n.T(lang, buyKey), resetStr, internalCSV, externalName)
+
+	rows := [][]models.InlineKeyboardButton{
+		{toggleBtn(lang, enabled, "trial:toggle"), btn(i18n.T(lang, "trial.btn_quick"), "trial:quick")},
+		{btn(i18n.T(lang, "trial.btn_days"), "trial:days"), btn(i18n.T(lang, "trial.btn_gb"), "trial:gb")},
+		{btn(i18n.T(lang, "trial.btn_hwid"), "trial:hwid"), btn(i18n.T(lang, "trial.btn_squads"), "trial:squads")},
+		{btn(i18n.T(lang, "trial.btn_strategy"), "trial:strategy"), btn(i18n.T(lang, "trial.btn_allow_buy"), "trial:allowbuy")},
+		{toggleBtn(lang, reset.ResetUnused, "trial:resettoggle"), btn(i18n.T(lang, "trial.btn_reset"), "trial:resetmax")},
+		{btn(i18n.T(lang, "trial.btn_reset_pct"), "trial:resetpct")},
+		{btn(i18n.T(lang, "btn.back"), "menu:pay"), btn(i18n.T(lang, "btn.home"), "menu:home")},
+	}
+	a.sendPayKB(ctx, chatID, body, rows)
+}
+
+func (a *App) onTrialAdmin(ctx context.Context, chatID int64, val string) {
+	lang := a.lang(chatID)
+	action, arg, _ := cut3(val)
+	switch action {
+	case "toggle":
+		a.mu.Lock()
+		if a.botCfg != nil {
+			a.botCfg.Trial.Enabled = !a.botCfg.Trial.Enabled
+		}
+		a.mu.Unlock()
+		_ = a.saveBotConfig(ctx)
+		a.showTrialAdmin(ctx, chatID)
+	case "allowbuy":
+		a.mu.Lock()
+		if a.botCfg != nil {
+			a.botCfg.Trial.AllowBuy = !a.botCfg.Trial.AllowBuy
+		}
+		a.mu.Unlock()
+		_ = a.saveBotConfig(ctx)
+		a.showTrialAdmin(ctx, chatID)
+	case "resettoggle":
+		a.mu.Lock()
+		if a.botCfg != nil {
+			a.botCfg.Trial.ResetUnused = !a.botCfg.Trial.ResetUnused
+			// Включили впервые — потолок повторов обязан быть ненулевым,
+			// иначе тумблер «включено» ничего не делает и выглядит поломкой.
+			if a.botCfg.Trial.ResetUnused && a.botCfg.Trial.ResetUnusedMax <= 0 {
+				a.botCfg.Trial.ResetUnusedMax = 1
+			}
+		}
+		a.mu.Unlock()
+		_ = a.saveBotConfig(ctx)
+		a.showTrialAdmin(ctx, chatID)
+	case "resetpct":
+		a.getUI(chatID).adminInput = "trial_reset_pct"
+		a.askInput(ctx, chatID, i18n.T(lang, "trial.ask_reset_pct"), "menu:trial")
+	case "resetmax":
+		a.getUI(chatID).adminInput = "trial_reset_max"
+		a.askInput(ctx, chatID, i18n.T(lang, "trial.ask_reset_max"), "menu:trial")
+	case "days":
+		a.getUI(chatID).adminInput = "trial_days"
+		a.askInput(ctx, chatID, i18n.T(lang, "trial.ask_days"), "menu:trial")
+	case "gb":
+		a.getUI(chatID).adminInput = "trial_gb"
+		a.askInput(ctx, chatID, i18n.T(lang, "trial.ask_gb"), "menu:trial")
+	case "hwid":
+		a.sendKB(ctx, chatID, i18n.T(lang, "trial.ask_hwid"), [][]models.InlineKeyboardButton{
+			{btn(i18n.T(lang, "pricing.dev_1"), "trial:hwidset:1"),
+				btn(i18n.T(lang, "pricing.dev_3"), "trial:hwidset:3"),
+				btn(i18n.T(lang, "pricing.dev_custom"), "trial:hwidset:custom")},
+			{btn(i18n.T(lang, "pricing.dev_default"), "trial:hwidset:0")},
+			{btn(i18n.T(lang, "btn.back"), "menu:trial"), btn(i18n.T(lang, "btn.home"), "menu:home")},
+		})
+	case "hwidset":
+		if arg == "custom" {
+			a.getUI(chatID).adminInput = "trial_hwid"
+			a.askInput(ctx, chatID, i18n.T(lang, "trial.ask_hwid_custom"), "menu:trial")
+			return
+		}
+		n, _ := strconv.Atoi(arg)
+		a.setTrialHWID(n)
+		_ = a.saveBotConfig(ctx)
+		a.showTrialAdmin(ctx, chatID)
+	case "squads":
+		a.showTrialSquads(ctx, chatID)
+	case "intsq":
+		a.toggleTrialInternal(arg)
+		_ = a.saveBotConfig(ctx)
+		a.showTrialSquads(ctx, chatID)
+	case "extsq":
+		a.toggleTrialExternal(arg)
+		_ = a.saveBotConfig(ctx)
+		a.showTrialSquads(ctx, chatID)
+	case "quick":
+		a.startTrialQuick(ctx, chatID)
+	case "strategy":
+		a.sendKB(ctx, chatID, i18n.T(lang, "trial.ask_strategy"), [][]models.InlineKeyboardButton{
+			{btn("📅 MONTH", "trial:setstrat:MONTH"), btn("🔁 MONTH_ROLLING", "trial:setstrat:MONTH_ROLLING")},
+			{btn("🗓 WEEK", "trial:setstrat:WEEK"), btn("📆 DAY", "trial:setstrat:DAY")},
+			{btn("♾ NO_RESET", "trial:setstrat:NO_RESET")},
+			{btn(i18n.T(lang, "trial.strat_btn_inherit"), "trial:setstrat:-")},
+			{btn(i18n.T(lang, "btn.back"), "menu:trial"), btn(i18n.T(lang, "btn.home"), "menu:home")},
+		})
+	case "setstrat":
+		v := arg
+		if v == "-" || !model.ValidStrategy(v) {
+			// «Как у тарифа» и любой подделанный callback — сброс к наследованию.
+			v = ""
+		}
+		a.mu.Lock()
+		if a.botCfg != nil {
+			a.botCfg.Trial.Strategy = v
+		}
+		a.mu.Unlock()
+		_ = a.saveBotConfig(ctx)
+		a.showTrialAdmin(ctx, chatID)
+	}
+}
+
+func (a *App) showTrialSquads(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.mu.Lock()
+	panel := a.panel
+	a.mu.Unlock()
+	back := []models.InlineKeyboardButton{
+		btn(i18n.T(lang, "btn.back"), "menu:trial"),
+		btn(i18n.T(lang, "btn.home"), "menu:home"),
+	}
+	if panel == nil {
+		a.sendPayKB(ctx, chatID, i18n.T(lang, "squads.no_panel"), [][]models.InlineKeyboardButton{back})
+		return
+	}
+	intSquads, _ := panel.ListSquads(ctx)
+	extSquads, _ := panel.ListExternalSquads(ctx)
+	_, _, _, _, activeInt, activeExt := a.trialCfg()
+	isActive := func(uuid string) bool {
+		for _, u := range activeInt {
+			if u == uuid {
+				return true
+			}
+		}
+		return false
+	}
+	rows := make([][]models.InlineKeyboardButton, 0, len(intSquads)+len(extSquads)+2)
+	for _, sq := range intSquads {
+		mark := "⬜"
+		if isActive(sq.UUID) {
+			mark = "✅"
+		}
+		rows = append(rows, []models.InlineKeyboardButton{
+			btn(mark+" 🏠 "+sq.Name, "trial:intsq:"+sq.UUID),
+		})
+	}
+	if len(extSquads) > 0 {
+		rows = append(rows, []models.InlineKeyboardButton{btn("— 📡 External —", "trial:noop")})
+		for _, sq := range extSquads {
+			mark := "⚪"
+			if activeExt == sq.UUID {
+				mark = "🟢"
+			}
+			rows = append(rows, []models.InlineKeyboardButton{
+				btn(mark+" 📡 "+sq.Name, "trial:extsq:"+sq.UUID),
+			})
+		}
+	}
+	rows = append(rows, back)
+	a.sendPayKB(ctx, chatID, i18n.T(lang, "trial.squads_title", len(intSquads), len(extSquads), len(activeInt)), rows)
+}
+
+func (a *App) startTrialQuick(ctx context.Context, chatID int64) {
+	a.getUI(chatID).adminInput = "trial_q_days"
+	a.askInput(ctx, chatID, i18n.T(a.lang(chatID), "trial.q_days"), "menu:trial")
+}
+
+func (a *App) toggleTrialInternal(uuid string) {
+	if uuid == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg == nil {
+		return
+	}
+	cur := a.botCfg.Trial.InternalSquads
+	for i, u := range cur {
+		if u == uuid {
+			a.botCfg.Trial.InternalSquads = append(cur[:i], cur[i+1:]...)
+			return
+		}
+	}
+	a.botCfg.Trial.InternalSquads = append(cur, uuid)
+}
+
+func (a *App) toggleTrialExternal(uuid string) {
+	if uuid == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg == nil {
+		return
+	}
+	if a.botCfg.Trial.ExternalSquadUUID == uuid {
+		a.botCfg.Trial.ExternalSquadUUID = ""
+	} else {
+		a.botCfg.Trial.ExternalSquadUUID = uuid
+	}
+}
+
+func (a *App) setTrialDays(n int) {
+	if n < 0 {
+		n = 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg != nil {
+		a.botCfg.Trial.Days = n
+	}
+}
+
+func (a *App) setTrialGB(n int) {
+	if n < 0 {
+		n = 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg != nil {
+		a.botCfg.Trial.TrafficGB = n
+	}
+}
+
+func (a *App) setTrialHWID(n int) {
+	if n < 0 {
+		n = 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg != nil {
+		a.botCfg.Trial.DeviceLimit = n
+	}
+}
+
+// setTrialResetPct — порог «не воспользовался» в процентах лимита.
+// 100 и больше означало бы «возвращать всем подряд», поэтому потолок 99.
+func (a *App) setTrialResetPct(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if n > 99 {
+		n = 99
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg != nil {
+		a.botCfg.Trial.ResetUnusedPct = n
+	}
+}
+
+// setTrialResetMax — сколько раз одному человеку можно вернуть триал.
+// Ноль выключает возврат целиком: иначе тот, кто никогда не купит, крутил бы
+// пробный период бесконечно.
+func (a *App) setTrialResetMax(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if n > 10 {
+		n = 10
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg == nil {
+		return
+	}
+	a.botCfg.Trial.ResetUnusedMax = n
+	if n == 0 {
+		a.botCfg.Trial.ResetUnused = false
+	}
+}
+
+func (a *App) trialAvailable(ctx context.Context, chatID int64) bool {
+	a.mu.Lock()
+	enabled := a.botCfg != nil && a.botCfg.Trial.Enabled && a.botCfg.Trial.Days > 0
+	a.mu.Unlock()
+	if !enabled || a.store == nil {
+		return false
+	}
+	u, _ := a.store.GetUser(ctx, chatID)
+	if u == nil {
+		return true
+	}
+	return u.TrialUsedAt == "" && u.SubExpireAt == ""
+}
+
+func (a *App) activateTrial(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	if a.syncPanelAccount(ctx, chatID) {
+		if u, _ := a.store.GetUser(ctx, chatID); u != nil && u.SubExpireAt != "" {
+			a.notify(ctx, chatID, i18n.T(lang, "sync.linked", formatExpire(u.SubExpireAt, lang)))
+		}
+	}
+	link, expireAt, ok, err := a.trialOnce(ctx, chatID)
+	if !ok {
+		a.sendHome(ctx, chatID, i18n.T(lang, "trial.not_available"))
+		return
+	}
+	if err != nil {
+		a.sendHome(ctx, chatID, i18n.T(lang, "trial.fail", err.Error()))
+		return
+	}
+	a.sendSubActive(ctx, chatID, link, expireAt)
+}
+
+// trialOnce — проверка доступности и выдача под пер-пользовательским замком.
+//
+// Порознь они не работают: чат и веб-поверхности живут в разных горутинах, и
+// два одновременных запроса успевали пройти проверку оба — триал выдавался
+// дважды, а дни складывались. Замок тот же, что сериализует выдачу подписки по
+// пользователю. ok=false — триал недоступен (выдачи не было).
+func (a *App) trialOnce(ctx context.Context, chatID int64) (link, expireAt string, ok bool, err error) {
+	lk := &a.finalizeUserLk[extLockIndex(strconv.FormatInt(chatID, 10))]
+	lk.Lock()
+	defer lk.Unlock()
+	if !a.trialAvailable(ctx, chatID) {
+		return "", "", false, nil
+	}
+	link, expireAt, err = a.trialProvision(ctx, chatID)
+	return link, expireAt, true, err
+}
+
+// trialProvision performs the panel-side trial provisioning and bookkeeping
+// (no chat messages, no availability check). Shared source of truth for the
+// chat handler and the Mini App. Callers must check trialAvailable first.
+func (a *App) trialProvision(ctx context.Context, chatID int64) (string, string, error) {
+	a.mu.Lock()
+	panel := a.panel
+	tr := a.botCfg.Trial
+	// Набор сквадов уезжает в панель уже без замка, а админка правит его на
+	// месте — append идёт по тому же массиву, поэтому здесь нужна своя копия.
+	tr.InternalSquads = append([]string(nil), tr.InternalSquads...)
+	// Своя стратегия триала главнее сетки; пусто (или потерянное откатом
+	// поле) — стратегия сетки, как всегда было.
+	strategy := a.botCfg.Pricing.ResetStrategy()
+	if model.ValidStrategy(tr.Strategy) {
+		strategy = tr.Strategy
+	}
+	a.mu.Unlock()
+	if panel == nil {
+		return "", "", errors.New("panel offline")
+	}
+	link, expireAt, err := panel.CreateOrUpdateUserDays(ctx, chatID, tr.Days, remnawave.UserLimits{
+		TrafficBytes: int64(tr.TrafficGB) * 1024 * 1024 * 1024,
+		// «0 = безлимит» в настройках триала — тоже осознанный ноль.
+		TrafficSet:     true,
+		DeviceLimit:    tr.DeviceLimit,
+		InternalSquads: tr.InternalSquads,
+		ExternalSquad:  tr.ExternalSquadUUID,
+		Strategy:       strategy,
+	})
+	if err != nil {
+		return "", "", err
+	}
+	link = a.rewriteSub(link)
+	if a.store != nil {
+		// Триал уже выдан в панели. Если отметка об использовании не запишется,
+		// проверка доступности снова скажет «можно» — и триал будет выдаваться
+		// сколько угодно раз. Молчать тут нельзя: зовём админа.
+		markErr := a.store.SetTrialUsed(ctx, chatID, time.Now().UTC().Format(time.RFC3339))
+		_ = a.store.AddPayment(ctx, &model.Payment{
+			TelegramID: chatID, Method: model.PayMethodTrial, Months: 0, Amount: "—",
+			Status: model.PaymentPaid,
+		})
+		if err := a.store.SetSubExpiry(ctx, chatID, expireAt, "trial"); err != nil && markErr == nil {
+			markErr = err
+		}
+		if markErr != nil {
+			a.log.Error("триал выдан, но не записан", "tg_id", chatID, "err", markErr)
+			// Фоновый контекст: запрос из мини-аппа мог уже отмениться, а это
+			// единственный сигнал о том, что триал стал бесконечным.
+			bg := a.bgContext()
+			alang := a.lang(a.cfg.AdminID)
+			a.notify(bg, a.cfg.AdminID, i18n.T(alang, "admin.trial_unrecorded", a.userLabelByID(bg, chatID)))
+		}
+	}
+	a.invalidateSubCache(chatID)
+	// Триал не сбрасывает трафик основной подписки — значит и доп-подписке нельзя.
+	a.syncAddSub(ctx, chatID, false)
+	return link, expireAt, nil
+}

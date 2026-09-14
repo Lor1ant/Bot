@@ -1,0 +1,2678 @@
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"remnabot/internal/crypto"
+	"remnabot/internal/model"
+)
+
+var ErrDuplicateExtID = errors.New("storage: payment with this ext_id already exists")
+
+type Storage interface {
+	Migrate(ctx context.Context) error
+
+	LoadConfig(ctx context.Context) (*model.BotConfig, bool, error)
+	SaveConfig(ctx context.Context, cfg *model.BotConfig) error
+
+	GetScreenMsg(ctx context.Context, chatID int64) (int, error)
+	SetScreenMsg(ctx context.Context, chatID int64, msgID int) error
+
+	UpsertUser(ctx context.Context, telegramID int64) error
+
+	SetUserInfo(ctx context.Context, telegramID int64, username, firstName string) error
+	GetUser(ctx context.Context, telegramID int64) (*model.User, error)
+	SetP2PApproved(ctx context.Context, telegramID int64, approved bool) error
+
+	HasApprovedPurchase(ctx context.Context, telegramID int64) (bool, error)
+
+	ListUsers(ctx context.Context, limit, offset int) ([]model.User, int, error)
+	SearchUsers(ctx context.Context, q string, limit, offset int) ([]model.User, int, error)
+	SetBlocked(ctx context.Context, telegramID int64, blocked bool) error
+	SetWhitelisted(ctx context.Context, telegramID int64, on bool) error
+	AddWhitelistID(ctx context.Context, telegramID int64) error
+	RemoveWhitelistID(ctx context.Context, telegramID int64) error
+	IsWhitelistID(ctx context.Context, telegramID int64) (bool, error)
+	ListWhitelistIDs(ctx context.Context) ([]int64, error)
+	WhitelistAllUsers(ctx context.Context) (int64, error)
+	ClearWhitelistAll(ctx context.Context) (int64, error)
+	ClearWhitelistIDs(ctx context.Context) (int64, error)
+	BalanceHeld(ctx context.Context) (int64, int, error)
+	CountWhitelisted(ctx context.Context) (int, error)
+	ListWhitelistedUsers(ctx context.Context, limit, offset int) ([]model.User, int, error)
+
+	CreateInvite(ctx context.Context, inv *model.Invite) error
+	GetInvite(ctx context.Context, code string) (*model.Invite, error)
+	ListInvites(ctx context.Context) ([]model.Invite, error)
+	UseInvite(ctx context.Context, code string) (bool, error)
+	RevokeInvite(ctx context.Context, code string) error
+	DeleteInvite(ctx context.Context, code string) error
+
+	SetAutoPay(ctx context.Context, ap *model.AutoPay) error
+	UpdateAutoPaySnapshot(ctx context.Context, telegramID int64, snap *model.PlanSnapshot) error
+	GetAutoPay(ctx context.Context, telegramID int64) (*model.AutoPay, error)
+	SetAutoPayEnabled(ctx context.Context, telegramID int64, on bool) error
+	UpdateAutoPayResult(ctx context.Context, telegramID int64, lastPayAt, nextTryAt string, fails int, lastError string) error
+	MarkAutoPayCharged(ctx context.Context, telegramID int64, lastPayAt, paidPeriod, nextTryAt, lastError string) error
+	ListAutoPay(ctx context.Context) ([]model.AutoPay, error)
+	DeleteAutoPay(ctx context.Context, telegramID int64) error
+	DeleteUser(ctx context.Context, telegramID int64) error
+	AllUserIDs(ctx context.Context) ([]int64, error)
+	// SetUnreachable помечает, что Telegram ответил «чат недоступен». Это НЕ
+	// бан: доступ к боту не закрывается, метка только выводит человека из
+	// рассылки и снимается любым его сообщением.
+	SetUnreachable(ctx context.Context, telegramID int64, at string) error
+
+	SetPurchaseIntent(ctx context.Context, in *model.PurchaseIntent) error
+	PurchaseIntent(ctx context.Context, telegramID int64) (*model.PurchaseIntent, error)
+	DeletePurchaseIntent(ctx context.Context, telegramID int64) error
+	DeletePurchaseIntentFor(ctx context.Context, telegramID int64, months int, createdAt string) error
+
+	SetInvoiceSnapshot(ctx context.Context, telegramID int64, method string, months int, snap *model.PlanSnapshot) error
+	InvoiceSnapshot(ctx context.Context, telegramID int64, method string, months int) (*model.PlanSnapshot, string, error)
+	DeleteInvoiceSnapshot(ctx context.Context, telegramID int64, method string, months int) error
+	PurgeInvoiceSnapshots(ctx context.Context, before string) error
+
+	SavePlan(ctx context.Context, p *model.Plan) error
+	GetPlan(ctx context.Context, code string) (*model.Plan, error)
+	ListPlans(ctx context.Context) ([]model.Plan, error)
+	DeletePlan(ctx context.Context, code string) error
+
+	GrantPlanAccess(ctx context.Context, code string, tgID int64, email string) error
+	RevokePlanAccess(ctx context.Context, code string, tgID int64, email string) error
+	HasPlanAccess(ctx context.Context, code string, tgID int64, email string) (bool, error)
+	ListPlanAccess(ctx context.Context, code string) ([]model.PlanAccess, error)
+	ListAllPlanAccess(ctx context.Context) ([]model.PlanAccess, error)
+	ClearPlanAccess(ctx context.Context, code string) error
+	PrunePlanAccess(ctx context.Context) error
+	CountUsersOnPlan(ctx context.Context, code, activeAfter string) (int, error)
+
+	CreatePromo(ctx context.Context, p *model.PromoCode) error
+	CreateWebUser(ctx context.Context, u *model.WebUser) error
+	GetWebUserByEmail(ctx context.Context, email string) (*model.WebUser, error)
+	GetWebUserByTgID(ctx context.Context, tgID int64) (*model.WebUser, error)
+	SetWebApproved(ctx context.Context, tgID int64, approved bool) error
+	SetWebDenied(ctx context.Context, tgID int64, denied bool) error
+	SetWebUserVerified(ctx context.Context, tgID int64, at string) error
+	SetWebUserPassword(ctx context.Context, tgID int64, hash string) error
+	UserSessEpoch(ctx context.Context, tgID int64) (int, error)
+	BumpSessEpoch(ctx context.Context, tgID int64) (int, error)
+	PutEmailToken(ctx context.Context, t *model.EmailToken) error
+	TakeEmailToken(ctx context.Context, hash, purpose string) (*model.EmailToken, error)
+	RevokeEmailTokens(ctx context.Context, tgID int64, purpose string) error
+	CountEmailTokensSince(ctx context.Context, tgID int64, purpose, since string) (int, error)
+	PurgeEmailTokens(ctx context.Context, before string) error
+	AccountFootprint(ctx context.Context, tgID int64) (AccountFootprint, error)
+	MoveAccount(ctx context.Context, from, to int64) error
+	GetPromo(ctx context.Context, code string) (*model.PromoCode, error)
+	ListPromos(ctx context.Context) ([]model.PromoCode, error)
+	DeletePromo(ctx context.Context, code string) error
+	PromoRedeemedBy(ctx context.Context, code string, telegramID int64) (bool, error)
+	RedeemPromo(ctx context.Context, code string, telegramID int64) (bool, error)
+	ReleasePromo(ctx context.Context, code string, telegramID int64) error
+
+	DeletePaymentsByUser(ctx context.Context, telegramID int64) error
+	DeleteP2PRequestsByUser(ctx context.Context, telegramID int64) error
+
+	SetTermsAccepted(ctx context.Context, telegramID int64, ts string) error
+	// ResetTermsAccepted снимает согласие с документами со всех пользователей:
+	// документы изменились, и согласие на прошлую редакцию не считается.
+	ResetTermsAccepted(ctx context.Context) error
+
+	SetTrialUsed(ctx context.Context, telegramID int64, ts string) error
+
+	SetSubExpiry(ctx context.Context, telegramID int64, expireAt, kind string) error
+
+	MarkNotified(ctx context.Context, telegramID int64, sentCSV string) error
+
+	UsersForNotify(ctx context.Context) ([]model.User, error)
+
+	AddBalance(ctx context.Context, telegramID int64, kopecks int64) error
+
+	DeductBalance(ctx context.Context, telegramID int64, kopecks int64) (bool, error)
+
+	SetReferredBy(ctx context.Context, telegramID, referrerID int64) error
+	SetRefBonusPaid(ctx context.Context, telegramID int64) error
+	AddRefEarned(ctx context.Context, telegramID int64, kopecks int64) error
+	CountReferrals(ctx context.Context, referrerID int64) (int, error)
+
+	CreateP2PRequest(ctx context.Context, r *model.P2PRequest) error
+	GetP2PRequest(ctx context.Context, id int64) (*model.P2PRequest, error)
+	// LastAwaitingP2PRequest — последняя заявка пользователя, ждущая чек.
+	// Нужна, когда ожидание чека в памяти потеряно (перезапуск бота).
+	OpenP2PRequest(ctx context.Context, telegramID int64) (*model.P2PRequest, error)
+	ListP2PRequestsByStatus(ctx context.Context, status string, limit int) ([]model.P2PRequest, error)
+	// Ping — жива ли база. Нужен проверке «бот жив»: без него она отвечала
+	// «всё хорошо» при отвалившемся хранилище.
+	Ping(ctx context.Context) error
+	LastAwaitingP2PRequest(ctx context.Context, telegramID int64) (*model.P2PRequest, error)
+	UpdateP2PRequest(ctx context.Context, r *model.P2PRequest) error
+
+	AddPayment(ctx context.Context, p *model.Payment) error
+	AddPaymentAndBalance(ctx context.Context, p *model.Payment, kopecks int64) error
+	SetPaymentStatus(ctx context.Context, extID, status string) error
+	ListPayments(ctx context.Context, limit, offset int) ([]model.Payment, int, error)
+	HasPaidPayment(ctx context.Context, telegramID int64) (bool, error)
+	SetUserSnapshot(ctx context.Context, telegramID int64, snap *model.PlanSnapshot) error
+	ListSubRepairTargets(ctx context.Context) ([]SubRepairTarget, error)
+	ListTrialResetTargets(ctx context.Context, maxResets, limit int) ([]TrialResetTarget, error)
+	SetTrafficBonus(ctx context.Context, telegramID int64, b *model.TrafficBonus) error
+	ListTrafficBonuses(ctx context.Context, limit int) ([]TrafficBonusTarget, error)
+	ResetTrialForRepeat(ctx context.Context, telegramID int64, expectExpire string) (bool, error)
+	TrialResets(ctx context.Context, telegramID int64) (int, error)
+	SetPaymentSnapshot(ctx context.Context, id int64, snap *model.PlanSnapshot) error
+	LastPaidSubPayment(ctx context.Context, telegramID int64) (*model.Payment, error)
+
+	PaidPayments(ctx context.Context) ([]model.Payment, error)
+	PaymentByExtID(ctx context.Context, extID string) (bool, error)
+
+	MostPopularPlan(ctx context.Context) (months int, total int, err error)
+
+	LoadMediaFileID(ctx context.Context, section string) (id string, ok bool, err error)
+	SaveMediaFileID(ctx context.Context, section, fileID string) error
+
+	DeleteMediaFileID(ctx context.Context, section string) error
+
+	Export(ctx context.Context) (*Snapshot, error)
+	Import(ctx context.Context, s *Snapshot) error
+
+	AddPendingInvoice(ctx context.Context, p *model.PendingInvoice) error
+
+	ListUnresolvedPending(ctx context.Context, createdBefore string, limit int) ([]model.PendingInvoice, error)
+	ResolvePending(ctx context.Context, id int64) error
+
+	PendingByExtID(ctx context.Context, extID string) (*model.PendingInvoice, error)
+
+	AddPayLog(ctx context.Context, e *model.PayLogEntry) error
+	PayLogs(ctx context.Context, extID string, telegramID int64, limit int) ([]model.PayLogEntry, error)
+	AllPayLogs(ctx context.Context, limit int) ([]model.PayLogEntry, error)
+	// PayLogsFiltered отбирает записи журнала НА СТОРОНЕ БД по этапам и времени
+	// и вторым значением отдаёт полное число подходящих записей. Именно полное
+	// число, а не длину среза: иначе на нагруженном боте выгрузка молча теряла
+	// бы всё, что не поместилось в лимит, и админ об этом не узнал бы.
+	PayLogsFiltered(ctx context.Context, stages []string, since string, limit int) ([]model.PayLogEntry, int64, error)
+	PurgePayLogs(ctx context.Context, before string) error
+
+	AddTorrentReport(ctx context.Context, r *model.TorrentReport) error
+	// TorrentReports — страница журнала (новые сверху) + общее число записей.
+	TorrentReports(ctx context.Context, limit, offset int) ([]model.TorrentReport, int, error)
+	// UserTorrentReports — страница журнала по одному нарушителю (новые сверху)
+	// + общее число его отчётов. Идентичность та же, что у счётчика: telegram_id,
+	// а у безтелеграмных аккаунтов — username панели.
+	UserTorrentReports(ctx context.Context, telegramID int64, username string, limit, offset int) ([]model.TorrentReport, int, error)
+	// CountTorrentReports — число отчётов по пользователю (по telegram_id, а
+	// для аккаунтов без Telegram — по username панели) начиная с since.
+	CountTorrentReports(ctx context.Context, telegramID int64, username, since string) (int, error)
+	// CountTorrentReportsAll — число отчётов по всем; пустой since = за всё время.
+	CountTorrentReportsAll(ctx context.Context, since string) (int, error)
+	// DueTorrentUnblocks — записи, по которым пора уведомить о снятии
+	// блокировки: срок вышел, уведомление не отправлено, есть telegram_id.
+	DueTorrentUnblocks(ctx context.Context, now string) ([]model.TorrentReport, error)
+	MarkTorrentUnblockNotified(ctx context.Context, id int64) error
+	// PendingTorrentUnblocksByIP — ещё не отработанные записи по адресу:
+	// нужны, когда админ снимает блокировку раньше срока вручную.
+	PendingTorrentUnblocksByIP(ctx context.Context, ip string) ([]model.TorrentReport, error)
+	// SetTorrentStrike/TorrentStrikeAt — момент последней автоблокировки по
+	// торрентам. С него начинается новый отсчёт нарушений: иначе вернувшего
+	// доступ пользователя выключало бы снова до конца окна повторов.
+	SetTorrentStrike(ctx context.Context, telegramID int64, at string) error
+	TorrentStrikeAt(ctx context.Context, telegramID int64) (string, error)
+	PurgeTorrentReports(ctx context.Context, before string) error
+
+	Kind() string
+	Close() error
+}
+
+func Open(kind, dsn string, crypter *crypto.Crypter) (Storage, error) {
+	switch kind {
+	case model.DBSQLite:
+		return openSQLite(dsn, crypter)
+	case model.DBPostgres:
+		return openPostgres(dsn, crypter)
+	default:
+		return nil, fmt.Errorf("неизвестный движок БД: %q", kind)
+	}
+}
+
+type base struct {
+	db      *sql.DB
+	kind    string
+	ph      placeholderFunc
+	crypter *crypto.Crypter
+}
+
+type placeholderFunc func(n int) string
+
+func (b *base) Kind() string { return b.kind }
+func (b *base) Close() error { return b.db.Close() }
+
+// GetScreenMsg returns the persisted id of the last screen message for a chat
+// (0 if none). Lets the bot delete the previous screen even after a restart,
+// when the in-memory tracking map has been wiped.
+func (b *base) GetScreenMsg(ctx context.Context, chatID int64) (int, error) {
+	var id int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT msg_id FROM screen_state WHERE chat_id = "+b.ph(1), chatID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
+}
+
+// SetScreenMsg persists the id of the last screen message shown to a chat.
+func (b *base) SetScreenMsg(ctx context.Context, chatID int64, msgID int) error {
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO screen_state (chat_id, msg_id) VALUES ("+b.ph(1)+", "+b.ph(2)+") "+
+			"ON CONFLICT(chat_id) DO UPDATE SET msg_id = excluded.msg_id",
+		chatID, msgID)
+	return err
+}
+
+func (b *base) loadConfig(ctx context.Context) (*model.BotConfig, bool, error) {
+	var enc string
+	err := b.db.QueryRowContext(ctx, "SELECT config FROM settings WHERE id = 1").Scan(&enc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	plain, err := b.crypter.Decrypt(enc)
+	if err != nil {
+		return nil, false, fmt.Errorf("расшифровка конфига: %w", err)
+	}
+	var cfg model.BotConfig
+	if err := json.Unmarshal(plain, &cfg); err != nil {
+		return nil, false, fmt.Errorf("разбор конфига: %w", err)
+	}
+	return &cfg, true, nil
+}
+
+func (b *base) saveConfig(ctx context.Context, cfg *model.BotConfig, upsertSQL string) error {
+	plain, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	enc, err := b.crypter.Encrypt(plain)
+	if err != nil {
+		return err
+	}
+	_, err = b.db.ExecContext(ctx, upsertSQL, enc)
+	return err
+}
+
+func Transfer(ctx context.Context, src, dst Storage) error {
+	snap, err := src.Export(ctx)
+	if err != nil {
+		return err
+	}
+	if snap.Config != nil {
+		if err := dst.SaveConfig(ctx, snap.Config); err != nil {
+			return err
+		}
+	}
+	return dst.Import(ctx, snap)
+}
+
+func nowStr() string { return time.Now().UTC().Format(time.RFC3339) }
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (b *base) UpsertUser(ctx context.Context, telegramID int64) error {
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO users (telegram_id, p2p_approved, created_at) VALUES ("+b.ph(1)+", 0, "+b.ph(2)+") "+
+			"ON CONFLICT (telegram_id) DO NOTHING",
+		telegramID, nowStr())
+	return err
+}
+
+func (b *base) SetUserInfo(ctx context.Context, telegramID int64, username, firstName string) error {
+	// Человек написал боту — значит чат снова доступен, метку снимаем здесь
+	// же: отдельного места, где видно «вернулся», в боте нет.
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET username = "+b.ph(1)+", first_name = "+b.ph(2)+", unreachable_at = '' WHERE telegram_id = "+b.ph(3),
+		username, firstName, telegramID)
+	return err
+}
+
+func (b *base) HasApprovedPurchase(ctx context.Context, telegramID int64) (bool, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT COUNT(1) FROM p2p_requests WHERE telegram_id = "+b.ph(1)+" AND status = "+b.ph(2),
+		telegramID, model.P2PApproved).Scan(&n)
+	return n > 0, err
+}
+
+func (b *base) GetUser(ctx context.Context, telegramID int64) (*model.User, error) {
+	var approved, blocked int
+	var created, username, firstName string
+
+	var terms, trial sql.NullString
+	var subExp, notifyKind, notifySent string
+	var balance, referredBy int64
+	var refBonusPaid, whitelisted int
+	var refEarned int64
+	var webApproved, webDenied int
+	var snapRaw, bonusRaw string
+	var trialResets, sessEpoch int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT username, first_name, p2p_approved, blocked, created_at, terms_accepted_at, trial_used_at, sub_expire_at, notify_kind, notify_sent, balance, referred_by, ref_bonus_paid, whitelisted, ref_earned, web_approved, web_denied, plan_snapshot, trial_resets, traffic_bonus, sess_epoch FROM users WHERE telegram_id = "+b.ph(1), telegramID).
+		Scan(&username, &firstName, &approved, &blocked, &created, &terms, &trial, &subExp, &notifyKind, &notifySent, &balance, &referredBy, &refBonusPaid, &whitelisted, &refEarned, &webApproved, &webDenied, &snapRaw, &trialResets, &bonusRaw, &sessEpoch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &model.User{TelegramID: telegramID, Username: username, FirstName: firstName, P2PApproved: approved != 0, Blocked: blocked != 0, CreatedAt: created, TermsAcceptedAt: terms.String, TrialUsedAt: trial.String, SubExpireAt: subExp, NotifyKind: notifyKind, NotifySent: notifySent, Balance: balance, ReferredBy: referredBy, RefBonusPaid: refBonusPaid != 0, Whitelisted: whitelisted != 0, RefEarned: refEarned, WebApproved: webApproved != 0, WebDenied: webDenied != 0, Snapshot: model.DecodePlanSnapshot(snapRaw), TrialResets: trialResets, TrafficBonus: model.DecodeTrafficBonus(bonusRaw), SessEpoch: sessEpoch}, nil
+}
+
+func (b *base) SetP2PApproved(ctx context.Context, telegramID int64, approved bool) error {
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO users (telegram_id, p2p_approved, created_at) VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+") "+
+			"ON CONFLICT (telegram_id) DO UPDATE SET p2p_approved = excluded.p2p_approved",
+		telegramID, boolToInt(approved), nowStr())
+	return err
+}
+
+func (b *base) ListUsers(ctx context.Context, limit, offset int) ([]model.User, int, error) {
+	var total int
+	if err := b.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM users").Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id, username, first_name, p2p_approved, blocked, created_at FROM users "+
+			"ORDER BY created_at DESC, telegram_id DESC LIMIT "+b.ph(1)+" OFFSET "+b.ph(2),
+		limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.User
+	for rows.Next() {
+		var u model.User
+		var approved, blocked int
+		if err := rows.Scan(&u.TelegramID, &u.Username, &u.FirstName, &approved, &blocked, &u.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		u.P2PApproved = approved != 0
+		u.Blocked = blocked != 0
+		out = append(out, u)
+	}
+	return out, total, rows.Err()
+}
+
+// usersSearchLimit — страховка на случай нулевого/отрицательного лимита:
+// sqlite на LIMIT -1 отдаст всё, postgres упадёт с ошибкой.
+const usersSearchLimit = 50
+
+// likePattern готовит подстроку для LIKE: джокеры из пользовательского ввода
+// экранируются, иначе «100_» нашло бы и «1001», а «%» — вообще всех.
+func likePattern(q string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return "%" + r.Replace(q) + "%"
+}
+
+// SearchUsers ищет по нику, имени, Telegram ID и почте веб-аккаунта.
+// LOWER с обеих сторон обязателен: LIKE в sqlite регистронезависим только для
+// латиницы, а в postgres регистрозависим вовсе — без этого поиск «работал бы
+// на моей машине» и молча не находил ничего на боевой базе.
+func (b *base) SearchUsers(ctx context.Context, q string, limit, offset int) ([]model.User, int, error) {
+	// «@» перед ником отбрасываем ДО проверки на пустоту: иначе запрос из
+	// одного символа «@» превратился бы в пустую подстроку и нашёл всю базу.
+	q = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(q), "@"))
+	if q == "" {
+		return nil, 0, nil
+	}
+	if limit <= 0 {
+		limit = usersSearchLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	lower, raw := likePattern(strings.ToLower(q)), likePattern(q)
+	// Сравниваем и по LOWER, и как есть: LOWER в sqlite умеет только латиницу,
+	// поэтому кириллица там нашлась бы только по «опущенному» запросу, которого
+	// в базе нет. В postgres LOWER юникодный, и там работают оба варианта.
+	cols := []string{"u.username", "u.first_name", "CAST(u.telegram_id AS TEXT)", "w.email"}
+	var parts []string
+	args := make([]any, 0, len(cols)*2+2)
+	n := 0
+	for _, c := range cols {
+		n++
+		lo := b.ph(n)
+		args = append(args, lower)
+		n++
+		rw := b.ph(n)
+		args = append(args, raw)
+		parts = append(parts, "(LOWER("+c+") LIKE "+lo+" ESCAPE '\\' OR "+c+" LIKE "+rw+" ESCAPE '\\')")
+	}
+	where := "WHERE " + strings.Join(parts, " OR ")
+	from := "FROM users u LEFT JOIN web_users w ON w.tg_id = u.telegram_id "
+
+	var total int
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	if err := b.db.QueryRowContext(ctx, "SELECT COUNT(DISTINCT u.telegram_id) "+from+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT u.telegram_id, u.username, u.first_name, u.p2p_approved, u.blocked, u.created_at "+
+			from+where+" ORDER BY u.created_at DESC, u.telegram_id DESC LIMIT "+b.ph(n+1)+" OFFSET "+b.ph(n+2),
+		append(args, limit, offset)...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.User
+	for rows.Next() {
+		var u model.User
+		var approved, blocked int
+		if err := rows.Scan(&u.TelegramID, &u.Username, &u.FirstName, &approved, &blocked, &u.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		u.P2PApproved = approved != 0
+		u.Blocked = blocked != 0
+		out = append(out, u)
+	}
+	return out, total, rows.Err()
+}
+
+func (b *base) SetBlocked(ctx context.Context, telegramID int64, blocked bool) error {
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO users (telegram_id, p2p_approved, blocked, created_at) VALUES ("+b.ph(1)+", 0, "+b.ph(2)+", "+b.ph(3)+") "+
+			"ON CONFLICT (telegram_id) DO UPDATE SET blocked = excluded.blocked",
+		telegramID, boolToInt(blocked), nowStr())
+	return err
+}
+
+func (b *base) DeleteUser(ctx context.Context, telegramID int64) error {
+	// Автосписание лежит в отдельной таблице: если не удалить его вместе с
+	// пользователем, планировщик продолжит списывать деньги за удалённого.
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, _ = b.db.ExecContext(ctx, "DELETE FROM autopay WHERE telegram_id = "+b.ph(1), telegramID)
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, _ = b.db.ExecContext(ctx, "DELETE FROM purchase_intents WHERE telegram_id = "+b.ph(1), telegramID)
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, _ = b.db.ExecContext(ctx, "DELETE FROM invoice_snapshots WHERE telegram_id = "+b.ph(1), telegramID)
+	// Записи списков допущенных: удалённый аккаунт не должен молча сохранять
+	// допуск к тарифам «по списку». У e-mail-аккаунта кабинета чистится и
+	// запись по почте.
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, _ = b.db.ExecContext(ctx, "DELETE FROM plan_access WHERE telegram_id != 0 AND telegram_id = "+b.ph(1), telegramID)
+	{
+		// Знак идентификатора больше не признак «аккаунт по почте»: после
+		// привязки Telegram он положительный, а запись по адресу осталась.
+		if wu, _ := b.GetWebUserByTgID(ctx, telegramID); wu != nil && wu.Email != "" {
+			// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+			_, _ = b.db.ExecContext(ctx, "DELETE FROM plan_access WHERE email != '' AND email = "+b.ph(1), model.NormalizeEmail(wu.Email))
+		}
+	}
+	_, err := b.db.ExecContext(ctx, "DELETE FROM users WHERE telegram_id = "+b.ph(1), telegramID)
+	return err
+}
+
+func (b *base) DeletePaymentsByUser(ctx context.Context, telegramID int64) error {
+	_, err := b.db.ExecContext(ctx, "DELETE FROM payments WHERE telegram_id = "+b.ph(1), telegramID)
+	return err
+}
+
+func (b *base) DeleteP2PRequestsByUser(ctx context.Context, telegramID int64) error {
+	_, err := b.db.ExecContext(ctx, "DELETE FROM p2p_requests WHERE telegram_id = "+b.ph(1), telegramID)
+	return err
+}
+
+func (b *base) SetTermsAccepted(ctx context.Context, telegramID int64, ts string) error {
+
+	if ts == "" {
+		return nil
+	}
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET terms_accepted_at = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		ts, telegramID)
+	return err
+}
+
+func (b *base) ResetTermsAccepted(ctx context.Context) error {
+	// Тип колонки у движков разный: в Postgres это TIMESTAMPTZ NULL, в SQLite
+	// — TEXT NOT NULL DEFAULT ''. Пустая строка в timestamptz не пишется, NULL
+	// в SQLite ломает ограничение — отсюда две формы одного сброса.
+	val := "NULL"
+	if b.kind == model.DBSQLite {
+		val = "''"
+	}
+	_, err := b.db.ExecContext(ctx, "UPDATE users SET terms_accepted_at = "+val)
+	return err
+}
+
+func (b *base) SetTrialUsed(ctx context.Context, telegramID int64, ts string) error {
+	if ts == "" {
+		return nil
+	}
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET trial_used_at = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		ts, telegramID)
+	return err
+}
+
+func (b *base) SetSubExpiry(ctx context.Context, telegramID int64, expireAt, kind string) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET sub_expire_at = "+b.ph(1)+", notify_kind = "+b.ph(2)+", notify_sent = '' WHERE telegram_id = "+b.ph(3),
+		expireAt, kind, telegramID)
+	return err
+}
+
+func (b *base) MarkNotified(ctx context.Context, telegramID int64, sentCSV string) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET notify_sent = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		sentCSV, telegramID)
+	return err
+}
+
+func (b *base) AddBalance(ctx context.Context, telegramID int64, kopecks int64) error {
+	if kopecks == 0 {
+		return nil
+	}
+
+	if _, err := b.db.ExecContext(ctx,
+		"INSERT INTO users (telegram_id, p2p_approved, created_at) VALUES ("+b.ph(1)+", 0, "+b.ph(2)+") ON CONFLICT (telegram_id) DO NOTHING",
+		telegramID, nowStr()); err != nil {
+		return err
+	}
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET balance = balance + "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		kopecks, telegramID)
+	return err
+}
+
+func (b *base) DeductBalance(ctx context.Context, telegramID int64, kopecks int64) (bool, error) {
+	if kopecks <= 0 {
+		return false, nil
+	}
+	res, err := b.db.ExecContext(ctx,
+		"UPDATE users SET balance = balance - "+b.ph(1)+" WHERE telegram_id = "+b.ph(2)+" AND balance >= "+b.ph(3),
+		kopecks, telegramID, kopecks)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (b *base) UsersForNotify(ctx context.Context) ([]model.User, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id, username, first_name, sub_expire_at, notify_kind, notify_sent, blocked FROM users "+
+			"WHERE sub_expire_at <> '' AND blocked = 0 AND telegram_id > 0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.User
+	for rows.Next() {
+		var u model.User
+		var blocked int
+		if err := rows.Scan(&u.TelegramID, &u.Username, &u.FirstName, &u.SubExpireAt, &u.NotifyKind, &u.NotifySent, &blocked); err != nil {
+			return nil, err
+		}
+		u.Blocked = blocked != 0
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) CreateP2PRequest(ctx context.Context, r *model.P2PRequest) error {
+	if r.ID == 0 {
+		r.ID = time.Now().UnixNano()
+	}
+	if r.CreatedAt == "" {
+		r.CreatedAt = nowStr()
+	}
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO p2p_requests (id, telegram_id, months, price, status, screenshot, comment, created_at, decided_at, plan_snapshot, card) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+", "+b.ph(8)+", "+b.ph(9)+", "+b.ph(10)+", "+b.ph(11)+")",
+		r.ID, r.TelegramID, r.Months, r.Price, r.Status, r.Screenshot, r.Comment, r.CreatedAt, r.DecidedAt, r.Snapshot.Encode(), r.Card)
+	return err
+}
+
+func (b *base) GetP2PRequest(ctx context.Context, id int64) (*model.P2PRequest, error) {
+	r := &model.P2PRequest{}
+	var snapRaw string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT "+p2pCols+" FROM p2p_requests WHERE id = "+b.ph(1), id).
+		Scan(&r.ID, &r.TelegramID, &r.Months, &r.Price, &r.Status, &r.Screenshot, &r.Comment, &r.CreatedAt, &r.DecidedAt, &snapRaw, &r.Card)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Snapshot = model.DecodePlanSnapshot(snapRaw)
+	return r, nil
+}
+
+// OpenP2PRequest — незакрытая заявка пользователя: ожидающая чека или уже
+// приславшая его. Одна на человека: без этого каждое нажатие «Перевод на
+// карту» плодило новую строку, новый набор кнопок админу и (раньше) новую
+// перезапись конфига, а обслуживалась всё равно только последняя.
+// ListP2PRequestsByStatus — заявки в заданном статусе, новые сверху. Нужен
+// экрану «висящие заявки»: раньше заявку, чью карточку админ потерял, было не
+// найти ничем.
+func (b *base) ListP2PRequestsByStatus(ctx context.Context, status string, limit int) ([]model.P2PRequest, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+p2pCols+" FROM p2p_requests WHERE status = "+b.ph(1)+
+			" ORDER BY created_at DESC, id DESC LIMIT "+strconv.Itoa(limit), status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.P2PRequest
+	for rows.Next() {
+		var r model.P2PRequest
+		var snapRaw string
+		if err := rows.Scan(&r.ID, &r.TelegramID, &r.Months, &r.Price, &r.Status, &r.Screenshot,
+			&r.Comment, &r.CreatedAt, &r.DecidedAt, &snapRaw, &r.Card); err != nil {
+			return nil, err
+		}
+		r.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) OpenP2PRequest(ctx context.Context, telegramID int64) (*model.P2PRequest, error) {
+	r := &model.P2PRequest{}
+	var snapRaw string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT "+p2pCols+" FROM p2p_requests WHERE telegram_id = "+b.ph(1)+
+			" AND status IN ("+b.ph(2)+", "+b.ph(3)+") ORDER BY created_at DESC, id DESC LIMIT 1",
+		telegramID, model.P2PAwaiting, model.P2PSubmitted).
+		Scan(&r.ID, &r.TelegramID, &r.Months, &r.Price, &r.Status, &r.Screenshot, &r.Comment, &r.CreatedAt, &r.DecidedAt, &snapRaw, &r.Card)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Snapshot = model.DecodePlanSnapshot(snapRaw)
+	return r, nil
+}
+
+func (b *base) LastAwaitingP2PRequest(ctx context.Context, telegramID int64) (*model.P2PRequest, error) {
+	r := &model.P2PRequest{}
+	var snapRaw string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT "+p2pCols+" FROM p2p_requests WHERE telegram_id = "+b.ph(1)+" AND status = "+b.ph(2)+
+			" ORDER BY created_at DESC, id DESC LIMIT 1", telegramID, model.P2PAwaiting).
+		Scan(&r.ID, &r.TelegramID, &r.Months, &r.Price, &r.Status, &r.Screenshot, &r.Comment, &r.CreatedAt, &r.DecidedAt, &snapRaw, &r.Card)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Snapshot = model.DecodePlanSnapshot(snapRaw)
+	return r, nil
+}
+
+func (b *base) UpdateP2PRequest(ctx context.Context, r *model.P2PRequest) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE p2p_requests SET status = "+b.ph(1)+", screenshot = "+b.ph(2)+", comment = "+b.ph(3)+", decided_at = "+b.ph(4)+
+			" WHERE id = "+b.ph(5),
+		r.Status, r.Screenshot, r.Comment, r.DecidedAt, r.ID)
+	return err
+}
+
+func (b *base) AddPayment(ctx context.Context, p *model.Payment) error {
+	if p.ID == 0 {
+		p.ID = time.Now().UnixNano()
+	}
+	if p.CreatedAt == "" {
+		p.CreatedAt = nowStr()
+	}
+	// Столкновение id — не дубль сделки, а невезение с часами: пробуем новый.
+	for attempt := 0; ; attempt++ {
+		_, err := b.db.ExecContext(ctx,
+			"INSERT INTO payments (id, telegram_id, method, months, amount, status, comment, ext_id, created_at, plan_snapshot) "+
+				"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+", "+b.ph(8)+", "+b.ph(9)+", "+b.ph(10)+")",
+			p.ID, p.TelegramID, p.Method, p.Months, p.Amount, p.Status, p.Comment, p.ExtID, p.CreatedAt, p.Snapshot.Encode())
+		switch {
+		case err == nil:
+			return nil
+		case isExtIDDuplicate(err):
+			return ErrDuplicateExtID
+		case isPKCollision(err) && attempt < 3:
+			p.ID = nextPaymentID(p.ID)
+		default:
+			return err
+		}
+	}
+}
+
+// nextPaymentID — следующий свободный идентификатор платежа. Просто «+1»:
+// столкновение означает, что эта наносекунда занята, соседняя — почти наверняка
+// свободна.
+func nextPaymentID(cur int64) int64 {
+	if now := time.Now().UnixNano(); now > cur {
+		return now
+	}
+	return cur + 1
+}
+
+// AddPaymentAndBalance записывает платёж и зачисляет баланс ОДНОЙ транзакцией.
+//
+// Порознь это теряло пополнения навсегда: запись платежа — она же барьер
+// повторной обработки по ext_id, — ставилась первой, и сбой между двумя
+// запросами оставлял барьер стоять при нулевом балансе. Повторная доставка от
+// платёжки упиралась в этот барьер и уходила ни с чем, а сверка гасила счёт.
+// Деньги у эквайера есть, на балансе ноль, восстановить нечем.
+//
+// Порядок внутри транзакции обязателен: сначала вставка платежа. На Postgres
+// ошибка уникальности переводит транзакцию в аварийное состояние, и любой
+// следующий запрос в ней отказал бы; к тому же логически барьер и должен
+// срабатывать до денег. Дубль отдаётся как ErrDuplicateExtID и баланса не
+// касается.
+//
+// Потерянный ответ на успешный COMMIT транзакция не лечит — его лечит повтор:
+// платёж уже виден, finalizeTopUp выходит через дубль, баланс уже зачислен.
+// SetPaymentStatus меняет статус платежа по внешнему ключу сделки. Нужен для
+// возвратов: у ЮKassa и Telegram Stars платёж остаётся «успешным» навсегда, а
+// признак возврата приходит отдельно.
+//
+// Ключ — ext_id, а не id: возврат опознаётся именно им (у Stars это
+// telegram_payment_charge_id, у ЮKassa — id платежа). Пустой ext_id ничего не
+// меняет: у оплат без ключа отличить одну от другой нечем.
+func (b *base) SetPaymentStatus(ctx context.Context, extID, status string) error {
+	if extID == "" {
+		return errors.New("storage: пустой ключ сделки")
+	}
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE payments SET status = "+b.ph(1)+" WHERE ext_id = "+b.ph(2),
+		status, extID)
+	return err
+}
+
+func (b *base) AddPaymentAndBalance(ctx context.Context, p *model.Payment, kopecks int64) error {
+	if p == nil {
+		return errors.New("payment is nil")
+	}
+	if p.ID == 0 {
+		p.ID = time.Now().UnixNano()
+	}
+	if p.CreatedAt == "" {
+		p.CreatedAt = nowStr()
+	}
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// Откат после успешного Commit безвреден (sql.ErrTxDone) — это штатный
+	// способ не потерять откат ни на одной из веток выхода.
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO payments (id, telegram_id, method, months, amount, status, comment, ext_id, created_at, plan_snapshot) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+", "+b.ph(8)+", "+b.ph(9)+", "+b.ph(10)+")",
+		p.ID, p.TelegramID, p.Method, p.Months, p.Amount, p.Status, p.Comment, p.ExtID, p.CreatedAt, p.Snapshot.Encode()); err != nil {
+		if isExtIDDuplicate(err) {
+			return ErrDuplicateExtID
+		}
+		// Столкновение id внутри транзакции не чиним повтором: транзакция уже
+		// аварийная. Отдаём как обычную ошибку — счёт останется незакрытым, и
+		// сверка добьёт его через пару минут. Это честнее, чем сказать
+		// «уже зачислено» и потерять пополнение.
+		return err
+	}
+	if kopecks != 0 {
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO users (telegram_id, p2p_approved, created_at) VALUES ("+b.ph(1)+", 0, "+b.ph(2)+") ON CONFLICT (telegram_id) DO NOTHING",
+			p.TelegramID, nowStr()); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE users SET balance = balance + "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+			kopecks, p.TelegramID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// isUniqueViolation — нарушено ЛЮБОЕ уникальное ограничение. Годится там, где
+// важен сам факт («такая строка уже есть»): импорт дампа, погашение промокода.
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	if pg := pgError(err); pg != nil {
+		return pg.Code == pgUniqueViolation
+	}
+	switch sqliteCode(err) {
+	case sqliteUniqueIndex, sqliteUniquePK:
+		return true
+	}
+	return false
+}
+
+// uqPaymentsExtID — имя уникального индекса по (method, ext_id) из миграции
+// 0014. Одинаково в обоих диалектах у всех установок.
+const uqPaymentsExtID = "uq_payments_method_extid"
+
+// isExtIDDuplicate — платёж с таким ключом сделки УЖЕ записан.
+//
+// Отличать это от столкновения первичных ключей обязательно: id платежа — это
+// наносекунды текущего времени, и совпадение (две доставки в одну наносекунду,
+// грубый таймер, восстановление из бэкапа, импорт из другого бота) прежде
+// читалось как «уже оплачено». Пополнение при этом теряется: finalizeTopUp на
+// ErrDuplicateExtID выходит с nil, то есть «уже зачислено», а транзакция
+// откатилась и баланса нет.
+func isExtIDDuplicate(err error) bool {
+	if err == nil {
+		return false
+	}
+	if pg := pgError(err); pg != nil {
+		return pg.Code == pgUniqueViolation && pg.ConstraintName == uqPaymentsExtID
+	}
+	// SQLite имени индекса в ошибке не даёт, но различает коды: 2067 —
+	// уникальный индекс, 1555 — первичный ключ.
+	return sqliteCode(err) == sqliteUniqueIndex
+}
+
+// isPKCollision — столкнулись первичные ключи: тот же платёж тут ни при чём,
+// просто не повезло со временем. Лечится новым id.
+func isPKCollision(err error) bool {
+	if err == nil {
+		return false
+	}
+	if pg := pgError(err); pg != nil {
+		return pg.Code == pgUniqueViolation && strings.HasSuffix(pg.ConstraintName, "_pkey")
+	}
+	return sqliteCode(err) == sqliteUniquePK
+}
+
+func (b *base) ListPayments(ctx context.Context, limit, offset int) ([]model.Payment, int, error) {
+	var total int
+	if err := b.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM payments").Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+paymentCols+" FROM payments "+
+			"ORDER BY created_at DESC, id DESC LIMIT "+b.ph(1)+" OFFSET "+b.ph(2),
+		limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.Payment
+	for rows.Next() {
+		var p model.Payment
+		var snapRaw string
+		if err := rows.Scan(&p.ID, &p.TelegramID, &p.Method, &p.Months, &p.Amount, &p.Status, &p.Comment, &p.ExtID, &p.CreatedAt, &snapRaw); err != nil {
+			return nil, 0, err
+		}
+		p.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		out = append(out, p)
+	}
+	return out, total, rows.Err()
+}
+
+// subPaymentCond отбирает платежи, которые действительно являются покупкой
+// подписки. Триал (`method='trial'`) и пополнения баланса пишутся в ту же
+// таблицу с months = 0 — без этого условия они попадали и в «популярный
+// тариф», и в признак «пользователь платил».
+const subPaymentCond = " AND months > 0"
+
+func (b *base) MostPopularPlan(ctx context.Context) (int, int, error) {
+	var total int
+	if err := b.db.QueryRowContext(ctx,
+		"SELECT COUNT(1) FROM payments WHERE status = "+b.ph(1)+subPaymentCond,
+		model.PaymentPaid).Scan(&total); err != nil {
+		return 0, 0, err
+	}
+	if total == 0 {
+		return 0, 0, nil
+	}
+	var months int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT months FROM payments WHERE status = "+b.ph(1)+subPaymentCond+
+			" GROUP BY months ORDER BY COUNT(1) DESC, months ASC LIMIT 1",
+		model.PaymentPaid).Scan(&months)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, total, nil
+	}
+	if err != nil {
+		return 0, total, err
+	}
+	return months, total, nil
+}
+
+func (b *base) HasPaidPayment(ctx context.Context, telegramID int64) (bool, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT COUNT(1) FROM payments WHERE telegram_id = "+b.ph(1)+" AND status = "+b.ph(2)+subPaymentCond,
+		telegramID, model.PaymentPaid).Scan(&n)
+	return n > 0, err
+}
+
+func (b *base) PaidPayments(ctx context.Context) ([]model.Payment, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+paymentCols+" FROM payments "+
+			"WHERE status = "+b.ph(1)+" ORDER BY created_at DESC",
+		model.PaymentPaid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Payment
+	for rows.Next() {
+		var p model.Payment
+		var snapRaw string
+		if err := rows.Scan(&p.ID, &p.TelegramID, &p.Method, &p.Months, &p.Amount, &p.Status, &p.Comment, &p.ExtID, &p.CreatedAt, &snapRaw); err != nil {
+			return nil, err
+		}
+		p.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) PaymentByExtID(ctx context.Context, extID string) (bool, error) {
+	if extID == "" {
+		return false, nil
+	}
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT COUNT(1) FROM payments WHERE ext_id = "+b.ph(1), extID).Scan(&n)
+	return n > 0, err
+}
+
+func (b *base) LoadMediaFileID(ctx context.Context, section string) (string, bool, error) {
+	var id string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT file_id FROM media_cache WHERE section = "+b.ph(1), section).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
+}
+
+func (b *base) SaveMediaFileID(ctx context.Context, section, fileID string) error {
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO media_cache (section, file_id, updated_at) VALUES ("+
+			b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+") "+
+			"ON CONFLICT (section) DO UPDATE SET file_id = excluded.file_id, updated_at = excluded.updated_at",
+		section, fileID, nowStr())
+	return err
+}
+
+func (b *base) DeleteMediaFileID(ctx context.Context, section string) error {
+	_, err := b.db.ExecContext(ctx,
+		"DELETE FROM media_cache WHERE section = "+b.ph(1), section)
+	return err
+}
+
+// Списки колонок вынесены в константы: снимок сделки добавил их сразу в
+// несколько запросов, и расхождение между SELECT и Scan ловится только в
+// рантайме.
+const (
+	paymentCols = "id, telegram_id, method, months, amount, status, comment, ext_id, created_at, plan_snapshot"
+	p2pCols     = "id, telegram_id, months, price, status, screenshot, comment, created_at, decided_at, plan_snapshot, card"
+	autoPayCols = "telegram_id, method, method_id, title, months, amount, currency, enabled, created_at, " +
+		"last_pay_at, paid_period, next_try_at, fails, last_error, plan_snapshot"
+)
+
+// SubRepairTarget — пользователь с действующей подпиской. Условия сделки
+// здесь намеренно НЕ хранятся: их источник — последняя покупка, а не история
+// пользователя (см. App.repairUser).
+type SubRepairTarget struct {
+	TelegramID  int64
+	SubExpireAt string
+}
+
+// Отметка «триал использован» лежит в РАЗНЫХ типах: в postgres это nullable
+// TIMESTAMPTZ, в sqlite — TEXT со значением по умолчанию «пусто». Сравнение с
+// пустой строкой в postgres падает на разборе запроса, а IS NOT NULL в sqlite
+// пропускает всех: колонка там пустая, но не NULL. Поэтому и предикат, и
+// «пустое значение» — по диалекту.
+func (b *base) trialUsedPredicate(prefix string) string {
+	if b.kind == model.DBPostgres {
+		return prefix + "trial_used_at IS NOT NULL"
+	}
+	return prefix + "trial_used_at <> ''"
+}
+
+func (b *base) trialUsedEmpty() string {
+	if b.kind == model.DBPostgres {
+		return "NULL"
+	}
+	return "''"
+}
+
+// TrafficBonusTarget — человек с накинутым разовым подарком трафика.
+type TrafficBonusTarget struct {
+	TelegramID int64
+	Bonus      *model.TrafficBonus
+}
+
+// SetTrafficBonus запоминает (или снимает, если b пустой) разовый подарок.
+func (b *base) SetTrafficBonus(ctx context.Context, telegramID int64, bonus *model.TrafficBonus) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET traffic_bonus = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		bonus.Encode(), telegramID)
+	return err
+}
+
+// ListTrafficBonuses отдаёт тех, у кого подарок ещё накинут.
+//
+// Порядок случайный и отсечка в SQL — по той же причине, что и у возврата
+// триала: подарок при стратегии NO_RESET живёт до конца подписки, такие люди
+// остаются в выборке надолго, и при стабильном порядке первые же двести
+// закрывали бы собой всех остальных.
+func (b *base) ListTrafficBonuses(ctx context.Context, limit int) ([]TrafficBonusTarget, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id, traffic_bonus FROM users WHERE traffic_bonus <> '' "+
+			"ORDER BY random() LIMIT "+b.ph(1), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TrafficBonusTarget
+	for rows.Next() {
+		var id int64
+		var raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		if bonus := model.DecodeTrafficBonus(raw); bonus != nil {
+			out = append(out, TrafficBonusTarget{TelegramID: id, Bonus: bonus})
+		}
+	}
+	return out, rows.Err()
+}
+
+// TrialResetTarget — кандидат на повторную выдачу пробного периода.
+type TrialResetTarget struct {
+	TelegramID  int64
+	SubExpireAt string
+	Resets      int
+}
+
+// ListTrialResetTargets отбирает тех, кому пробный период можно предложить
+// заново: он уже брался, срок в зеркале бота проставлен, потолок повторов не
+// выбран — и человек нам НИ РАЗУ не платил.
+//
+// «Не платил» проверяется по журналу платежей, а не по виду подписки: тот
+// сбрасывается ручными правками и откатами, а запись о платеже остаётся
+// навсегда. Пробный период сам пишет туда запись — её и только её исключаем,
+// иначе кандидатов не будет вообще. Пополнение баланса деньгами тоже платёж:
+// человек, который нам заплатил, повторный триал не получает. Возвращённый
+// платёж считается наравне с оплаченным: иначе схема «купил, вернул деньги»
+// открывала бы бесплатные триалы заново.
+//
+// Истёк ли срок и сколько трафика потрачено, решает вызывающий: и то и другое
+// правда только по панели.
+func (b *base) ListTrialResetTargets(ctx context.Context, maxResets, limit int) ([]TrialResetTarget, error) {
+	if maxResets <= 0 || limit <= 0 {
+		return nil, nil
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT u.telegram_id, u.sub_expire_at, u.trial_resets FROM users u "+
+			"WHERE "+b.trialUsedPredicate("u.")+" AND u.sub_expire_at <> '' AND u.blocked = 0 "+
+			"AND u.telegram_id > 0 AND u.unreachable_at = '' AND u.trial_resets < "+b.ph(1)+" "+
+			"AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.telegram_id = u.telegram_id "+
+			"AND p.method <> "+b.ph(2)+" AND (p.status = "+b.ph(3)+" OR p.status = "+b.ph(4)+")) "+
+			// Порядок СЛУЧАЙНЫЙ, и отсечка — здесь, а не в вызывающем.
+			// Кандидат, которому возврат не положен (трафик выбран, учётки в
+			// панели нет, срок продлили руками), из выборки не уходит никогда:
+			// при стабильном порядке первые же полторы сотни таких навсегда
+			// закрывали бы собой всех остальных, и проход работал бы вхолостую.
+			"ORDER BY random() LIMIT "+b.ph(5),
+		maxResets, model.PayMethodTrial, model.PaymentPaid, model.PaymentRefunded, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TrialResetTarget
+	for rows.Next() {
+		var t TrialResetTarget
+		if err := rows.Scan(&t.TelegramID, &t.SubExpireAt, &t.Resets); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ResetTrialForRepeat снимает отметку об использованном пробном периоде и
+// поднимает счётчик повторов. Второе значение — сработало ли.
+//
+// expectExpire — срок, который проход видел при отборе. Сверка с ним в самом
+// UPDATE обязательна: между отбором и записью человек мог ОПЛАТИТЬ подписку, и
+// безусловная очистка стёрла бы срок только что купленного. Отметка о триале в
+// условии закрывает вторую гонку, двух проходов между собой: иначе счётчик
+// повторов вырос бы дважды за один возврат.
+//
+// Зеркало срока и окна напоминаний очищаются здесь же: подписки больше нет, а
+// оставленное notify_sent погасило бы напоминания следующего периода.
+func (b *base) ResetTrialForRepeat(ctx context.Context, telegramID int64, expectExpire string) (bool, error) {
+	if expectExpire == "" {
+		return false, nil
+	}
+	res, err := b.db.ExecContext(ctx,
+		"UPDATE users SET trial_used_at = "+b.trialUsedEmpty()+", sub_expire_at = '', "+
+			"notify_kind = '', notify_sent = '', trial_resets = trial_resets + 1 "+
+			"WHERE telegram_id = "+b.ph(1)+" AND sub_expire_at = "+b.ph(2)+
+			" AND "+b.trialUsedPredicate(""), telegramID, expectExpire)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// TrialResets — сколько раз боту приходилось возвращать этому человеку пробный
+// период. Нужен привязке панельного аккаунта: возвращённый триал нельзя
+// отбирать обратно.
+func (b *base) TrialResets(ctx context.Context, telegramID int64) (int, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT trial_resets FROM users WHERE telegram_id = "+b.ph(1), telegramID).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// ListSubRepairTargets возвращает кандидатов на сверку лимитов.
+//
+// Фильтра по users.plan_snapshot здесь нет намеренно: его пишет только новый
+// образ бота, и отбор по нему выкинул бы ровно тех, ради кого сверка нужна
+// больше всего, — людей, у которых ПЕРВАЯ покупка прошла во время отката.
+func (b *base) ListSubRepairTargets(ctx context.Context) ([]SubRepairTarget, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id, sub_expire_at FROM users "+
+			"WHERE sub_expire_at <> '' AND blocked = 0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SubRepairTarget
+	for rows.Next() {
+		var t SubRepairTarget
+		if err := rows.Scan(&t.TelegramID, &t.SubExpireAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// LastPaidSubPayment — последняя оплаченная покупка подписки пользователя
+// (пополнения баланса и триал сюда не попадают).
+func (b *base) LastPaidSubPayment(ctx context.Context, telegramID int64) (*model.Payment, error) {
+	p := &model.Payment{}
+	var snapRaw string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT "+paymentCols+" FROM payments WHERE telegram_id = "+b.ph(1)+
+			" AND status = "+b.ph(2)+subPaymentCond+" ORDER BY created_at DESC, id DESC LIMIT 1",
+		telegramID, model.PaymentPaid).
+		Scan(&p.ID, &p.TelegramID, &p.Method, &p.Months, &p.Amount, &p.Status, &p.Comment, &p.ExtID, &p.CreatedAt, &snapRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.Snapshot = model.DecodePlanSnapshot(snapRaw)
+	return p, nil
+}
+
+// SetPaymentSnapshot дописывает снимок в уже записанный платёж.
+func (b *base) SetPaymentSnapshot(ctx context.Context, id int64, snap *model.PlanSnapshot) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"UPDATE payments SET plan_snapshot = "+b.ph(1)+" WHERE id = "+b.ph(2),
+		snap.Encode(), id)
+	return err
+}
+
+// SetUserSnapshot запоминает условия действующей подписки пользователя.
+func (b *base) SetUserSnapshot(ctx context.Context, telegramID int64, snap *model.PlanSnapshot) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"INSERT INTO users (telegram_id, p2p_approved, created_at, plan_snapshot) VALUES ("+b.ph(1)+", 0, "+b.ph(2)+", "+b.ph(3)+") "+
+			"ON CONFLICT (telegram_id) DO UPDATE SET plan_snapshot = excluded.plan_snapshot",
+		telegramID, nowStr(), snap.Encode())
+	return err
+}
+
+type Snapshot struct {
+	Config    *model.BotConfig
+	Users     []model.User
+	Payments  []model.Payment
+	P2P       []model.P2PRequest
+	Media     []MediaItem
+	Promos    []model.PromoCode
+	PromoUses []PromoUse
+	PayLogs   []model.PayLogEntry
+	// AutoPays и Pendings раньше в снимок не входили: после переезда базы
+	// или восстановления из бэкапа подключённые автосписания пропадали, а
+	// незакрытые счета переставали добиваться реконсилятором.
+	AutoPays []model.AutoPay
+	Pendings []model.PendingInvoice
+	// Plans — справочник тарифов. В снимок входит с самого появления таблицы:
+	// без него переезд базы стирал бы всю тарифную сетку.
+	Plans []model.Plan
+	// PlanAccess — списки допущенных к тарифам: без них переезд базы молча
+	// отрезал бы всех покупателей тарифов «по списку».
+	PlanAccess []model.PlanAccess
+	// Intents — незавершённые намерения покупки. Переезд базы посреди покупки
+	// редок, но без них человек, выбравший год, доплачивал бы месяц.
+	Intents []model.PurchaseIntent
+	// WhitelistIDs — предзаполненный белый список, Invites — приглашения. Обе
+	// таблицы раньше в снимок не входили: переезд базы молча терял и тех, кому
+	// доступ выдали заранее, и невыданные приглашения.
+	WhitelistIDs []int64
+	Invites      []model.Invite
+	// InvoiceSnaps — условия выставленных счетов Stars: строки счёта у них
+	// нет, и без переноса оплата пришла бы на текущие условия, а не на
+	// проданные.
+	InvoiceSnaps []InvoiceSnap
+	// WebUsers — аккаунты кабинета, заведённые по почте. В снимок не входили:
+	// смена движка базы стирала им и почту, и пароль, а сами строки users
+	// оставались — человек видел свою подписку только до конца выданного
+	// пропуска и войти заново уже не мог.
+	WebUsers []model.WebUser
+}
+
+type PromoUse struct {
+	Code       string
+	TelegramID int64
+	CreatedAt  string
+}
+
+// InvoiceSnap — строка условий выставленного счёта для снимка базы.
+type InvoiceSnap struct {
+	TelegramID int64
+	Method     string
+	Months     int
+	Snapshot   *model.PlanSnapshot
+	CreatedAt  string
+}
+
+type MediaItem struct {
+	Section string
+	FileID  string
+}
+
+func (b *base) Export(ctx context.Context) (*Snapshot, error) {
+	snap := &Snapshot{}
+	if cfg, ok, err := b.loadConfig(ctx); err != nil {
+		return nil, err
+	} else if ok {
+		snap.Config = cfg
+	}
+
+	urows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id, username, first_name, p2p_approved, blocked, created_at, terms_accepted_at, trial_used_at, sub_expire_at, notify_kind, notify_sent, balance, referred_by, ref_bonus_paid, whitelisted, ref_earned, web_approved, web_denied, plan_snapshot, trial_resets, traffic_bonus, sess_epoch FROM users")
+	if err != nil {
+		return nil, err
+	}
+	for urows.Next() {
+		var u model.User
+		var approved, blocked, refBonusPaid, whitelisted int
+		var refEarned int64
+		var webApproved, webDenied int
+		var terms, trial sql.NullString
+		var snapRaw, bonusRaw string
+		if err := urows.Scan(&u.TelegramID, &u.Username, &u.FirstName, &approved, &blocked, &u.CreatedAt, &terms, &trial, &u.SubExpireAt, &u.NotifyKind, &u.NotifySent, &u.Balance, &u.ReferredBy, &refBonusPaid, &whitelisted, &refEarned, &webApproved, &webDenied, &snapRaw, &u.TrialResets, &bonusRaw, &u.SessEpoch); err != nil {
+			_ = urows.Close()
+			return nil, err
+		}
+		u.P2PApproved = approved != 0
+		u.Blocked = blocked != 0
+		u.RefBonusPaid = refBonusPaid != 0
+		u.Whitelisted = whitelisted != 0
+		u.RefEarned = refEarned
+		u.WebApproved = webApproved != 0
+		u.WebDenied = webDenied != 0
+		u.TermsAcceptedAt = terms.String
+		u.TrialUsedAt = trial.String
+		u.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		u.TrafficBonus = model.DecodeTrafficBonus(bonusRaw)
+		snap.Users = append(snap.Users, u)
+	}
+	if err := urows.Err(); err != nil {
+		_ = urows.Close()
+		return nil, err
+	}
+	_ = urows.Close()
+
+	prows, err := b.db.QueryContext(ctx,
+		"SELECT "+paymentCols+" FROM payments")
+	if err != nil {
+		return nil, err
+	}
+	for prows.Next() {
+		var p model.Payment
+		var snapRaw string
+		if err := prows.Scan(&p.ID, &p.TelegramID, &p.Method, &p.Months, &p.Amount, &p.Status, &p.Comment, &p.ExtID, &p.CreatedAt, &snapRaw); err != nil {
+			_ = prows.Close()
+			return nil, err
+		}
+		p.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		snap.Payments = append(snap.Payments, p)
+	}
+	if err := prows.Err(); err != nil {
+		_ = prows.Close()
+		return nil, err
+	}
+	_ = prows.Close()
+
+	rrows, err := b.db.QueryContext(ctx,
+		"SELECT "+p2pCols+" FROM p2p_requests")
+	if err != nil {
+		return nil, err
+	}
+	for rrows.Next() {
+		var r model.P2PRequest
+		var snapRaw string
+		if err := rrows.Scan(&r.ID, &r.TelegramID, &r.Months, &r.Price, &r.Status, &r.Screenshot, &r.Comment, &r.CreatedAt, &r.DecidedAt, &snapRaw, &r.Card); err != nil {
+			_ = rrows.Close()
+			return nil, err
+		}
+		r.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		snap.P2P = append(snap.P2P, r)
+	}
+	if err := rrows.Err(); err != nil {
+		_ = rrows.Close()
+		return nil, err
+	}
+	_ = rrows.Close()
+
+	mrows, err := b.db.QueryContext(ctx, "SELECT section, file_id FROM media_cache")
+	if err != nil {
+		return nil, err
+	}
+	for mrows.Next() {
+		var m MediaItem
+		if err := mrows.Scan(&m.Section, &m.FileID); err != nil {
+			_ = mrows.Close()
+			return nil, err
+		}
+		snap.Media = append(snap.Media, m)
+	}
+	if err := mrows.Err(); err != nil {
+		_ = mrows.Close()
+		return nil, err
+	}
+	_ = mrows.Close()
+
+	if promos, err := b.ListPromos(ctx); err == nil {
+		snap.Promos = promos
+	} else {
+		return nil, err
+	}
+	if plans, err := b.ListPlans(ctx); err == nil {
+		snap.Plans = plans
+	} else {
+		return nil, err
+	}
+	if access, err := b.ListAllPlanAccess(ctx); err == nil {
+		snap.PlanAccess = access
+	} else {
+		return nil, err
+	}
+	if ids, err := b.ListWhitelistIDs(ctx); err == nil {
+		snap.WhitelistIDs = ids
+	} else {
+		return nil, err
+	}
+	if inv, err := b.ListInvites(ctx); err == nil {
+		snap.Invites = inv
+	} else {
+		return nil, err
+	}
+	intentRows, err := b.db.QueryContext(ctx, "SELECT "+intentCols+" FROM purchase_intents")
+	if err != nil {
+		return nil, err
+	}
+	for intentRows.Next() {
+		var in model.PurchaseIntent
+		if err := intentRows.Scan(&in.TelegramID, &in.PlanCode, &in.Months, &in.Days, &in.CreatedAt, &in.ShownPrice); err != nil {
+			_ = intentRows.Close()
+			return nil, err
+		}
+		snap.Intents = append(snap.Intents, in)
+	}
+	if err := intentRows.Err(); err != nil {
+		_ = intentRows.Close()
+		return nil, err
+	}
+	_ = intentRows.Close()
+
+	snapRows, err := b.db.QueryContext(ctx, "SELECT "+invoiceSnapCols+" FROM invoice_snapshots")
+	if err != nil {
+		return nil, err
+	}
+	for snapRows.Next() {
+		var v InvoiceSnap
+		var raw string
+		if err := snapRows.Scan(&v.TelegramID, &v.Method, &v.Months, &raw, &v.CreatedAt); err != nil {
+			_ = snapRows.Close()
+			return nil, err
+		}
+		v.Snapshot = model.DecodePlanSnapshot(raw)
+		snap.InvoiceSnaps = append(snap.InvoiceSnaps, v)
+	}
+	if err := snapRows.Err(); err != nil {
+		_ = snapRows.Close()
+		return nil, err
+	}
+	_ = snapRows.Close()
+
+	wrows, err := b.db.QueryContext(ctx, "SELECT tg_id, email, pass_hash, created_at, email_verified_at FROM web_users")
+	if err != nil {
+		return nil, err
+	}
+	for wrows.Next() {
+		var wu model.WebUser
+		if err := wrows.Scan(&wu.TgID, &wu.Email, &wu.PassHash, &wu.CreatedAt, &wu.VerifiedAt); err != nil {
+			_ = wrows.Close()
+			return nil, err
+		}
+		snap.WebUsers = append(snap.WebUsers, wu)
+	}
+	if err := wrows.Err(); err != nil {
+		_ = wrows.Close()
+		return nil, err
+	}
+	_ = wrows.Close()
+
+	urows2, err := b.db.QueryContext(ctx, "SELECT code, telegram_id, created_at FROM promo_redemptions")
+	if err != nil {
+		return nil, err
+	}
+	for urows2.Next() {
+		var u PromoUse
+		if err := urows2.Scan(&u.Code, &u.TelegramID, &u.CreatedAt); err != nil {
+			_ = urows2.Close()
+			return nil, err
+		}
+		snap.PromoUses = append(snap.PromoUses, u)
+	}
+	if err := urows2.Err(); err != nil {
+		_ = urows2.Close()
+		return nil, err
+	}
+	_ = urows2.Close()
+
+	lrows, err := b.db.QueryContext(ctx,
+		"SELECT id, ext_id, telegram_id, method, stage, detail, created_at FROM payment_log")
+	if err != nil {
+		return nil, err
+	}
+	for lrows.Next() {
+		var e model.PayLogEntry
+		if err := lrows.Scan(&e.ID, &e.ExtID, &e.TelegramID, &e.Method, &e.Stage, &e.Detail, &e.CreatedAt); err != nil {
+			_ = lrows.Close()
+			return nil, err
+		}
+		snap.PayLogs = append(snap.PayLogs, e)
+	}
+	if err := lrows.Err(); err != nil {
+		_ = lrows.Close()
+		return nil, err
+	}
+	_ = lrows.Close()
+
+	arows, err := b.db.QueryContext(ctx,
+		"SELECT "+autoPayCols+" FROM autopay")
+	if err != nil {
+		return nil, err
+	}
+	for arows.Next() {
+		var ap model.AutoPay
+		var enabled int
+		var snapRaw string
+		if err := arows.Scan(&ap.TelegramID, &ap.Method, &ap.MethodID, &ap.Title, &ap.Months, &ap.Amount,
+			&ap.Currency, &enabled, &ap.CreatedAt, &ap.LastPayAt, &ap.PaidPeriod, &ap.NextTryAt, &ap.Fails, &ap.LastError, &snapRaw); err != nil {
+			_ = arows.Close()
+			return nil, err
+		}
+		ap.Enabled = enabled != 0
+		ap.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		snap.AutoPays = append(snap.AutoPays, ap)
+	}
+	if err := arows.Err(); err != nil {
+		_ = arows.Close()
+		return nil, err
+	}
+	_ = arows.Close()
+
+	irows, err := b.db.QueryContext(ctx,
+		"SELECT id, method, ext_id, telegram_id, months, created_at, resolved, purpose, kopecks, plan_snapshot FROM pending_invoices")
+	if err != nil {
+		return nil, err
+	}
+	for irows.Next() {
+		var p model.PendingInvoice
+		var resolved int
+		var snapRaw string
+		if err := irows.Scan(&p.ID, &p.Method, &p.ExtID, &p.TelegramID, &p.Months, &p.CreatedAt, &resolved, &p.Purpose, &p.Kopecks, &snapRaw); err != nil {
+			_ = irows.Close()
+			return nil, err
+		}
+		p.Resolved = resolved != 0
+		p.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		snap.Pendings = append(snap.Pendings, p)
+	}
+	if err := irows.Err(); err != nil {
+		_ = irows.Close()
+		return nil, err
+	}
+	_ = irows.Close()
+
+	return snap, nil
+}
+
+func (b *base) Import(ctx context.Context, s *Snapshot) error {
+	if s == nil {
+		return nil
+	}
+	for i := range s.Users {
+		if err := b.importUser(ctx, &s.Users[i]); err != nil {
+			return err
+		}
+	}
+	for i := range s.Payments {
+		if err := b.AddPayment(ctx, &s.Payments[i]); err != nil && !errors.Is(err, ErrDuplicateExtID) {
+			return err
+		}
+	}
+	for i := range s.P2P {
+		if err := b.CreateP2PRequest(ctx, &s.P2P[i]); err != nil && !isUniqueViolation(err) {
+			return err
+		}
+	}
+	for i := range s.Media {
+		if err := b.SaveMediaFileID(ctx, s.Media[i].Section, s.Media[i].FileID); err != nil {
+			return err
+		}
+	}
+	for i := range s.Promos {
+		if err := b.CreatePromo(ctx, &s.Promos[i]); err != nil {
+			return err
+		}
+	}
+	for i := range s.Plans {
+		// Тариф с недопустимым кодом (например, записанный более новой
+		// версией с другими правилами) пропускаем: обрывать переезд всей базы
+		// из-за одной строки справочника нельзя.
+		if err := b.SavePlan(ctx, &s.Plans[i]); err != nil {
+			if !errors.Is(err, ErrPlanCode) {
+				return err
+			}
+			// Молчать нельзя: иначе оператор уверен, что переехало всё.
+			fmt.Printf("перенос базы: тариф %q пропущен — недопустимый код\n", s.Plans[i].Code)
+		}
+	}
+	for i := range s.PlanAccess {
+		e := &s.PlanAccess[i]
+		if err := b.grantPlanAccessAt(ctx, e.PlanCode, e.TelegramID, e.Email, e.CreatedAt); err != nil {
+			if !errors.Is(err, ErrPlanCode) && !errors.Is(err, ErrPlanAccessEntry) {
+				return err
+			}
+			// Молчать нельзя: иначе оператор уверен, что переехало всё.
+			fmt.Printf("перенос базы: запись списка допущенных тарифа %q пропущена\n", e.PlanCode)
+		}
+	}
+	for _, id := range s.WhitelistIDs {
+		if err := b.AddWhitelistID(ctx, id); err != nil {
+			return err
+		}
+	}
+	for i := range s.Invites {
+		if err := b.CreateInvite(ctx, &s.Invites[i]); err != nil && !isUniqueViolation(err) {
+			return err
+		}
+	}
+	for i := range s.Intents {
+		if err := b.SetPurchaseIntent(ctx, &s.Intents[i]); err != nil {
+			return err
+		}
+	}
+	for i := range s.InvoiceSnaps {
+		v := &s.InvoiceSnaps[i]
+		if err := b.setInvoiceSnapshotAt(ctx, v.TelegramID, v.Method, v.Months, v.Snapshot, v.CreatedAt); err != nil {
+			return err
+		}
+	}
+	for i := range s.WebUsers {
+		wu := &s.WebUsers[i]
+		if _, err := b.db.ExecContext(ctx,
+			"INSERT INTO web_users (tg_id, email, pass_hash, created_at, email_verified_at) "+
+				"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+") "+
+				"ON CONFLICT (tg_id) DO UPDATE SET email = excluded.email, pass_hash = excluded.pass_hash, "+
+				"created_at = excluded.created_at, email_verified_at = excluded.email_verified_at",
+			wu.TgID, wu.Email, wu.PassHash, wu.CreatedAt, wu.VerifiedAt); err != nil && !isUniqueViolation(err) {
+			return err
+		}
+	}
+	for i := range s.PromoUses {
+		if _, err := b.db.ExecContext(ctx,
+			"INSERT INTO promo_redemptions (code, telegram_id, created_at) VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+")",
+			s.PromoUses[i].Code, s.PromoUses[i].TelegramID, s.PromoUses[i].CreatedAt); err != nil && !isUniqueViolation(err) {
+			return err
+		}
+	}
+	for i := range s.PayLogs {
+		if err := b.AddPayLog(ctx, &s.PayLogs[i]); err != nil && !isUniqueViolation(err) {
+			return err
+		}
+	}
+	for i := range s.AutoPays {
+		if err := b.SetAutoPay(ctx, &s.AutoPays[i]); err != nil {
+			return err
+		}
+	}
+	for i := range s.Pendings {
+		p := &s.Pendings[i]
+		if _, err := b.db.ExecContext(ctx,
+			// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+			"INSERT INTO pending_invoices (id, method, ext_id, telegram_id, months, created_at, resolved, purpose, kopecks, plan_snapshot) "+
+				"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+", "+b.ph(8)+", "+b.ph(9)+", "+b.ph(10)+")",
+			p.ID, p.Method, p.ExtID, p.TelegramID, p.Months, p.CreatedAt, boolToInt(p.Resolved), p.Purpose, p.Kopecks, p.Snapshot.Encode()); err != nil && !isUniqueViolation(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *base) importUser(ctx context.Context, u *model.User) error {
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO users (telegram_id, p2p_approved, blocked, created_at, username, first_name, sub_expire_at, notify_kind, notify_sent, balance, referred_by, ref_bonus_paid, whitelisted, ref_earned, web_approved, web_denied, trial_resets, sess_epoch) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+", "+b.ph(8)+", "+b.ph(9)+", "+b.ph(10)+", "+b.ph(11)+", "+b.ph(12)+", "+b.ph(13)+", "+b.ph(14)+", "+b.ph(15)+", "+b.ph(16)+", "+b.ph(17)+", "+b.ph(18)+") "+
+			"ON CONFLICT (telegram_id) DO UPDATE SET "+
+			"p2p_approved = excluded.p2p_approved, blocked = excluded.blocked, "+
+			"created_at = excluded.created_at, username = excluded.username, first_name = excluded.first_name, "+
+			"sub_expire_at = excluded.sub_expire_at, notify_kind = excluded.notify_kind, notify_sent = excluded.notify_sent, "+
+			"balance = excluded.balance, referred_by = excluded.referred_by, ref_bonus_paid = excluded.ref_bonus_paid, whitelisted = excluded.whitelisted, ref_earned = excluded.ref_earned, web_approved = excluded.web_approved, web_denied = excluded.web_denied, trial_resets = excluded.trial_resets, sess_epoch = excluded.sess_epoch",
+		u.TelegramID, boolToInt(u.P2PApproved), boolToInt(u.Blocked), u.CreatedAt, u.Username, u.FirstName,
+		u.SubExpireAt, u.NotifyKind, u.NotifySent, u.Balance, u.ReferredBy, boolToInt(u.RefBonusPaid), boolToInt(u.Whitelisted), u.RefEarned, boolToInt(u.WebApproved), boolToInt(u.WebDenied), u.TrialResets, u.SessEpoch)
+	if err != nil {
+		return err
+	}
+	if u.Snapshot != nil {
+		if err := b.SetUserSnapshot(ctx, u.TelegramID, u.Snapshot); err != nil {
+			return err
+		}
+	}
+	if u.TermsAcceptedAt != "" {
+		if err := b.SetTermsAccepted(ctx, u.TelegramID, u.TermsAcceptedAt); err != nil {
+			return err
+		}
+	}
+	if u.TrialUsedAt != "" {
+		if err := b.SetTrialUsed(ctx, u.TelegramID, u.TrialUsedAt); err != nil {
+			return err
+		}
+	}
+	if u.TrafficBonus != nil {
+		if err := b.SetTrafficBonus(ctx, u.TelegramID, u.TrafficBonus); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *base) AddPayLog(ctx context.Context, e *model.PayLogEntry) error {
+	if e.ID == 0 {
+		e.ID = time.Now().UnixNano()
+	}
+	if e.CreatedAt == "" {
+		e.CreatedAt = nowStr()
+	}
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO payment_log (id, ext_id, telegram_id, method, stage, detail, created_at) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+")",
+		e.ID, e.ExtID, e.TelegramID, e.Method, e.Stage, e.Detail, e.CreatedAt)
+	return err
+}
+
+const torrentReportCols = "id, telegram_id, username, node, ip, protocol, inbound, source, destination, block_seconds, will_unblock_at, unblock_notified, created_at"
+
+func (b *base) scanTorrentReport(rows *sql.Rows) (model.TorrentReport, error) {
+	var r model.TorrentReport
+	var notified int
+	err := rows.Scan(&r.ID, &r.TelegramID, &r.Username, &r.Node, &r.IP, &r.Protocol, &r.Inbound,
+		&r.Source, &r.Destination, &r.BlockSeconds, &r.WillUnblockAt, &notified, &r.CreatedAt)
+	r.UnblockNotified = notified != 0
+	return r, err
+}
+
+func (b *base) AddTorrentReport(ctx context.Context, r *model.TorrentReport) error {
+	if r.ID == 0 {
+		r.ID = time.Now().UnixNano()
+	}
+	if r.CreatedAt == "" {
+		r.CreatedAt = nowStr()
+	}
+	// ON CONFLICT DO NOTHING: панель переотправляет вебхук, если не дождалась
+	// 200, а по журналу считаются страйки — дубликаты ускоряли бы отключение
+	// подписки. Идемпотентный id вычисляет вызывающий (см. torrentReportID).
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO torrent_reports ("+torrentReportCols+") VALUES ("+
+			b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+", "+
+			b.ph(8)+", "+b.ph(9)+", "+b.ph(10)+", "+b.ph(11)+", "+b.ph(12)+", "+b.ph(13)+") "+
+			"ON CONFLICT (id) DO NOTHING",
+		r.ID, r.TelegramID, r.Username, r.Node, r.IP, r.Protocol, r.Inbound,
+		r.Source, r.Destination, r.BlockSeconds, r.WillUnblockAt, boolToInt(r.UnblockNotified), r.CreatedAt)
+	return err
+}
+
+func (b *base) TorrentReports(ctx context.Context, limit, offset int) ([]model.TorrentReport, int, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int
+	if err := b.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM torrent_reports").Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+torrentReportCols+" FROM torrent_reports ORDER BY id DESC LIMIT "+b.ph(1)+" OFFSET "+b.ph(2),
+		limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.TorrentReport
+	for rows.Next() {
+		r, err := b.scanTorrentReport(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, r)
+	}
+	return out, total, rows.Err()
+}
+
+// torrentWho — отбор «этот нарушитель» для счётчика и журнала. Ветка выбирается
+// в Go, а не условием в SQL: сравнение плейсхолдера с литералом («$2 <> 0»)
+// заставляло Postgres выводить для параметра тип int4, и любой telegram_id
+// больше 2^31 (то есть почти любой живой) ронял запрос с ошибкой кодирования.
+// Заодно простой предикат по одной колонке нормально ложится на индекс.
+func (b *base) torrentWho(telegramID int64, username string, from int) (string, []any) {
+	if telegramID != 0 {
+		return "telegram_id = " + b.ph(from), []any{telegramID}
+	}
+	return "username <> '' AND username = " + b.ph(from), []any{username}
+}
+
+func (b *base) UserTorrentReports(ctx context.Context, telegramID int64, username string, limit, offset int) ([]model.TorrentReport, int, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	who, args := b.torrentWho(telegramID, username, 1)
+	where := " FROM torrent_reports WHERE " + who
+	var total int
+	if err := b.db.QueryRowContext(ctx, "SELECT COUNT(*)"+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+torrentReportCols+where+" ORDER BY id DESC LIMIT "+b.ph(len(args)+1)+" OFFSET "+b.ph(len(args)+2),
+		append(append([]any{}, args...), limit, offset)...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.TorrentReport
+	for rows.Next() {
+		r, err := b.scanTorrentReport(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, r)
+	}
+	return out, total, rows.Err()
+}
+
+// CountTorrentReports — число отчётов по нарушителю. Пустой since означает «за
+// всё время»: даты пишутся в RFC3339, а лексикографически любая строка >= "".
+func (b *base) CountTorrentReports(ctx context.Context, telegramID int64, username, since string) (int, error) {
+	who, args := b.torrentWho(telegramID, username, 1)
+	q := "SELECT COUNT(*) FROM torrent_reports WHERE " + who
+	if since != "" {
+		q += " AND created_at >= " + b.ph(len(args)+1)
+		args = append(args, since)
+	}
+	var n int
+	err := b.db.QueryRowContext(ctx, q, args...).Scan(&n)
+	return n, err
+}
+
+// CountTorrentReportsAll — число отчётов по всем сразу; пустой since = за всё время.
+func (b *base) CountTorrentReportsAll(ctx context.Context, since string) (int, error) {
+	q := "SELECT COUNT(*) FROM torrent_reports"
+	var args []any
+	if since != "" {
+		q += " WHERE created_at >= " + b.ph(1)
+		args = append(args, since)
+	}
+	var n int
+	err := b.db.QueryRowContext(ctx, q, args...).Scan(&n)
+	return n, err
+}
+
+func (b *base) DueTorrentUnblocks(ctx context.Context, now string) ([]model.TorrentReport, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+torrentReportCols+" FROM torrent_reports "+
+			"WHERE unblock_notified = 0 AND telegram_id <> 0 AND will_unblock_at <> '' AND will_unblock_at <= "+b.ph(1)+
+			" ORDER BY id ASC LIMIT 500", now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.TorrentReport
+	for rows.Next() {
+		r, err := b.scanTorrentReport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) PendingTorrentUnblocksByIP(ctx context.Context, ip string) ([]model.TorrentReport, error) {
+	if strings.TrimSpace(ip) == "" {
+		return nil, nil
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+torrentReportCols+" FROM torrent_reports "+
+			"WHERE unblock_notified = 0 AND ip = "+b.ph(1)+" ORDER BY id ASC LIMIT 500", ip)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.TorrentReport
+	for rows.Next() {
+		r, err := b.scanTorrentReport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) MarkTorrentUnblockNotified(ctx context.Context, id int64) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE torrent_reports SET unblock_notified = 1 WHERE id = "+b.ph(1), id)
+	return err
+}
+
+func (b *base) SetTorrentStrike(ctx context.Context, telegramID int64, at string) error {
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO torrent_strikes (tg_id, struck_at) VALUES ("+b.ph(1)+", "+b.ph(2)+") "+
+			"ON CONFLICT (tg_id) DO UPDATE SET struck_at = excluded.struck_at",
+		telegramID, at)
+	return err
+}
+
+func (b *base) TorrentStrikeAt(ctx context.Context, telegramID int64) (string, error) {
+	var at string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT struck_at FROM torrent_strikes WHERE tg_id = "+b.ph(1), telegramID).Scan(&at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return at, err
+}
+
+func (b *base) PurgeTorrentReports(ctx context.Context, before string) error {
+	_, err := b.db.ExecContext(ctx,
+		"DELETE FROM torrent_reports WHERE created_at < "+b.ph(1), before)
+	return err
+}
+
+func (b *base) AllPayLogs(ctx context.Context, limit int) ([]model.PayLogEntry, error) {
+	if limit <= 0 {
+		limit = 20000
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT id, ext_id, telegram_id, method, stage, detail, created_at FROM payment_log ORDER BY id DESC LIMIT "+b.ph(1), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.PayLogEntry
+	for rows.Next() {
+		var e model.PayLogEntry
+		if err := rows.Scan(&e.ID, &e.ExtID, &e.TelegramID, &e.Method, &e.Stage, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) PayLogs(ctx context.Context, extID string, telegramID int64, limit int) ([]model.PayLogEntry, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT id, ext_id, telegram_id, method, stage, detail, created_at FROM payment_log "+
+			"WHERE (ext_id <> '' AND ext_id = "+b.ph(1)+") OR ("+b.ph(2)+" > 0 AND telegram_id = "+b.ph(3)+") "+
+			"ORDER BY id ASC LIMIT "+b.ph(4),
+		extID, telegramID, telegramID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.PayLogEntry
+	for rows.Next() {
+		var e model.PayLogEntry
+		if err := rows.Scan(&e.ID, &e.ExtID, &e.TelegramID, &e.Method, &e.Stage, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) PayLogsFiltered(ctx context.Context, stages []string, since string, limit int) ([]model.PayLogEntry, int64, error) {
+	if limit <= 0 {
+		limit = 20000
+	}
+	where, args := "", []any{}
+	if len(stages) > 0 {
+		ph := make([]string, 0, len(stages))
+		for _, st := range stages {
+			args = append(args, st)
+			ph = append(ph, b.ph(len(args)))
+		}
+		where = " WHERE stage IN (" + strings.Join(ph, ", ") + ")"
+	}
+	if since != "" {
+		args = append(args, since)
+		cond := "created_at >= " + b.ph(len(args))
+		if where == "" {
+			where = " WHERE " + cond
+		} else {
+			where += " AND " + cond
+		}
+	}
+
+	var total int64
+	// #nosec G202 -- where собран из b.ph плейсхолдеров, значения идут аргументами
+	if err := b.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM payment_log"+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	args = append(args, limit)
+	// #nosec G202 -- см. выше
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT id, ext_id, telegram_id, method, stage, detail, created_at FROM payment_log"+where+
+			" ORDER BY id DESC LIMIT "+b.ph(len(args)), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.PayLogEntry
+	for rows.Next() {
+		var e model.PayLogEntry
+		if err := rows.Scan(&e.ID, &e.ExtID, &e.TelegramID, &e.Method, &e.Stage, &e.Detail, &e.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, e)
+	}
+	return out, total, rows.Err()
+}
+
+func (b *base) PurgePayLogs(ctx context.Context, before string) error {
+	_, err := b.db.ExecContext(ctx,
+		"DELETE FROM payment_log WHERE created_at < "+b.ph(1), before)
+	return err
+}
+
+func (b *base) AddPendingInvoice(ctx context.Context, p *model.PendingInvoice) error {
+	if p.ID == 0 {
+		p.ID = time.Now().UnixNano()
+	}
+	if p.CreatedAt == "" {
+		p.CreatedAt = nowStr()
+	}
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO pending_invoices (id, method, ext_id, telegram_id, months, created_at, resolved, purpose, kopecks, plan_snapshot) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", 0, "+b.ph(7)+", "+b.ph(8)+", "+b.ph(9)+")",
+		p.ID, p.Method, p.ExtID, p.TelegramID, p.Months, p.CreatedAt, p.Purpose, p.Kopecks, p.Snapshot.Encode())
+	return err
+}
+
+func (b *base) ListUnresolvedPending(ctx context.Context, createdBefore string, limit int) ([]model.PendingInvoice, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT id, method, ext_id, telegram_id, months, created_at, purpose, kopecks, plan_snapshot FROM pending_invoices "+
+			"WHERE resolved = 0 AND created_at <= "+b.ph(1)+" ORDER BY created_at ASC LIMIT "+b.ph(2),
+		createdBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.PendingInvoice
+	for rows.Next() {
+		var p model.PendingInvoice
+		var snapRaw string
+		if err := rows.Scan(&p.ID, &p.Method, &p.ExtID, &p.TelegramID, &p.Months, &p.CreatedAt, &p.Purpose, &p.Kopecks, &snapRaw); err != nil {
+			return nil, err
+		}
+		p.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) ResolvePending(ctx context.Context, id int64) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE pending_invoices SET resolved = 1 WHERE id = "+b.ph(1), id)
+	return err
+}
+
+func (b *base) PendingByExtID(ctx context.Context, extID string) (*model.PendingInvoice, error) {
+	if extID == "" {
+		return nil, nil
+	}
+	p := &model.PendingInvoice{}
+	var snapRaw string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT id, method, ext_id, telegram_id, months, created_at, purpose, kopecks, plan_snapshot FROM pending_invoices WHERE ext_id = "+b.ph(1)+" ORDER BY id DESC LIMIT 1", extID).
+		Scan(&p.ID, &p.Method, &p.ExtID, &p.TelegramID, &p.Months, &p.CreatedAt, &p.Purpose, &p.Kopecks, &snapRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.Snapshot = model.DecodePlanSnapshot(snapRaw)
+	return p, nil
+}
+
+func (b *base) SetReferredBy(ctx context.Context, telegramID, referrerID int64) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET referred_by = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2)+" AND referred_by = 0",
+		referrerID, telegramID)
+	return err
+}
+
+func (b *base) AddRefEarned(ctx context.Context, telegramID int64, kopecks int64) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET ref_earned = ref_earned + "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		kopecks, telegramID)
+	return err
+}
+
+func (b *base) SetRefBonusPaid(ctx context.Context, telegramID int64) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET ref_bonus_paid = 1 WHERE telegram_id = "+b.ph(1), telegramID)
+	return err
+}
+
+func (b *base) CountReferrals(ctx context.Context, referrerID int64) (int, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT COUNT(1) FROM users WHERE referred_by = "+b.ph(1), referrerID).Scan(&n)
+	return n, err
+}
+
+func (b *base) Ping(ctx context.Context) error { return b.db.PingContext(ctx) }
+
+func (b *base) SetUnreachable(ctx context.Context, telegramID int64, at string) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET unreachable_at = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2), at, telegramID)
+	return err
+}
+
+func (b *base) AllUserIDs(ctx context.Context) ([]int64, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id FROM users WHERE blocked = 0 AND unreachable_at = ''")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (b *base) CreateWebUser(ctx context.Context, u *model.WebUser) error {
+	if u.CreatedAt == "" {
+		u.CreatedAt = nowStr()
+	}
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO web_users (tg_id, email, pass_hash, created_at, email_verified_at) VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+")",
+		u.TgID, u.Email, u.PassHash, u.CreatedAt, u.VerifiedAt)
+	return err
+}
+
+func (b *base) GetWebUserByTgID(ctx context.Context, tgID int64) (*model.WebUser, error) {
+	u := &model.WebUser{}
+	err := b.db.QueryRowContext(ctx,
+		"SELECT tg_id, email, pass_hash, created_at, email_verified_at FROM web_users WHERE tg_id = "+b.ph(1), tgID).
+		Scan(&u.TgID, &u.Email, &u.PassHash, &u.CreatedAt, &u.VerifiedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (b *base) SetWebApproved(ctx context.Context, tgID int64, approved bool) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET web_approved = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		boolToInt(approved), tgID)
+	return err
+}
+
+func (b *base) SetWebDenied(ctx context.Context, tgID int64, denied bool) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET web_denied = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		boolToInt(denied), tgID)
+	return err
+}
+
+func (b *base) GetWebUserByEmail(ctx context.Context, email string) (*model.WebUser, error) {
+	u := &model.WebUser{}
+	err := b.db.QueryRowContext(ctx,
+		"SELECT tg_id, email, pass_hash, created_at, email_verified_at FROM web_users WHERE email = "+b.ph(1), email).
+		Scan(&u.TgID, &u.Email, &u.PassHash, &u.CreatedAt, &u.VerifiedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (b *base) CreatePromo(ctx context.Context, p *model.PromoCode) error {
+	if p.CreatedAt == "" {
+		p.CreatedAt = nowStr()
+	}
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO promo_codes (code, kind, value, max_uses, used, expires_at, created_at) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+") "+
+			"ON CONFLICT (code) DO UPDATE SET kind = excluded.kind, value = excluded.value, "+
+			"max_uses = excluded.max_uses, expires_at = excluded.expires_at",
+		p.Code, p.Kind, p.Value, p.MaxUses, p.Used, p.ExpiresAt, p.CreatedAt)
+	return err
+}
+
+func (b *base) GetPromo(ctx context.Context, code string) (*model.PromoCode, error) {
+	var p model.PromoCode
+	err := b.db.QueryRowContext(ctx,
+		"SELECT code, kind, value, max_uses, used, expires_at, created_at FROM promo_codes WHERE code = "+b.ph(1), code).
+		Scan(&p.Code, &p.Kind, &p.Value, &p.MaxUses, &p.Used, &p.ExpiresAt, &p.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (b *base) ListPromos(ctx context.Context) ([]model.PromoCode, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT code, kind, value, max_uses, used, expires_at, created_at FROM promo_codes ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.PromoCode
+	for rows.Next() {
+		var p model.PromoCode
+		if err := rows.Scan(&p.Code, &p.Kind, &p.Value, &p.MaxUses, &p.Used, &p.ExpiresAt, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) DeletePromo(ctx context.Context, code string) error {
+	_, err := b.db.ExecContext(ctx, "DELETE FROM promo_codes WHERE code = "+b.ph(1), code)
+	return err
+}
+
+func (b *base) PromoRedeemedBy(ctx context.Context, code string, telegramID int64) (bool, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT COUNT(1) FROM promo_redemptions WHERE code = "+b.ph(1)+" AND telegram_id = "+b.ph(2),
+		code, telegramID).Scan(&n)
+	return n > 0, err
+}
+
+// RedeemPromo закрепляет код за пользователем: первичный ключ
+// promo_redemptions не даёт активировать дважды, условный UPDATE — превысить
+// лимит активаций. false без ошибки — код уже активирован этим пользователем
+// либо лимит исчерпан.
+func (b *base) RedeemPromo(ctx context.Context, code string, telegramID int64) (bool, error) {
+	if _, err := b.db.ExecContext(ctx,
+		"INSERT INTO promo_redemptions (code, telegram_id, created_at) VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+")",
+		code, telegramID, nowStr()); err != nil {
+		if isUniqueViolation(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	res, err := b.db.ExecContext(ctx,
+		"UPDATE promo_codes SET used = used + 1 WHERE code = "+b.ph(1)+" AND (max_uses = 0 OR used < max_uses)", code)
+	if err == nil {
+		var n int64
+		if n, err = res.RowsAffected(); err == nil && n > 0 {
+			return true, nil
+		}
+	}
+	b.dropRedemption(ctx, code, telegramID)
+	return false, err
+}
+
+// ReleasePromo снимает закрепление, если начислить бонус не удалось.
+func (b *base) ReleasePromo(ctx context.Context, code string, telegramID int64) error {
+	b.dropRedemption(ctx, code, telegramID)
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE promo_codes SET used = used - 1 WHERE code = "+b.ph(1)+" AND used > 0", code)
+	return err
+}
+
+func (b *base) dropRedemption(ctx context.Context, code string, telegramID int64) {
+	_, _ = b.db.ExecContext(ctx,
+		"DELETE FROM promo_redemptions WHERE code = "+b.ph(1)+" AND telegram_id = "+b.ph(2),
+		code, telegramID)
+}
+
+func (b *base) SetWhitelisted(ctx context.Context, telegramID int64, on bool) error {
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE users SET whitelisted = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		boolToInt(on), telegramID)
+	return err
+}
+
+// AddWhitelistID добавляет Telegram ID в предзаполненный вайтлист (до регистрации).
+func (b *base) AddWhitelistID(ctx context.Context, telegramID int64) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значение telegramID передаётся биндовым параметром
+		"INSERT INTO whitelist (telegram_id) VALUES ("+b.ph(1)+") ON CONFLICT(telegram_id) DO NOTHING",
+		telegramID)
+	return err
+}
+
+// RemoveWhitelistID убирает Telegram ID из предзаполненного вайтлиста.
+func (b *base) RemoveWhitelistID(ctx context.Context, telegramID int64) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значение telegramID передаётся биндовым параметром
+		"DELETE FROM whitelist WHERE telegram_id = "+b.ph(1), telegramID)
+	return err
+}
+
+// IsWhitelistID сообщает, есть ли Telegram ID в предзаполненном вайтлисте.
+func (b *base) IsWhitelistID(ctx context.Context, telegramID int64) (bool, error) {
+	var x int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT 1 FROM whitelist WHERE telegram_id = "+b.ph(1), telegramID).Scan(&x)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ListWhitelistIDs возвращает все ID из предзаполненного вайтлиста.
+func (b *base) ListWhitelistIDs(ctx context.Context) ([]int64, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id FROM whitelist ORDER BY telegram_id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Приглашения (режим публичности «по приглашениям»)
+// ---------------------------------------------------------------------------
+
+// CreateInvite сохраняет новое приглашение. Код должен быть уникальным.
+func (b *base) CreateInvite(ctx context.Context, inv *model.Invite) error {
+	if inv.CreatedAt == "" {
+		inv.CreatedAt = nowStr()
+	}
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, err := b.db.ExecContext(ctx,
+		"INSERT INTO invites (code, max_uses, used, expires_at, created_at, revoked, note) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+")",
+		inv.Code, inv.MaxUses, inv.Used, inv.ExpiresAt, inv.CreatedAt, boolToInt(inv.Revoked), inv.Note)
+	return err
+}
+
+func (b *base) GetInvite(ctx context.Context, code string) (*model.Invite, error) {
+	var inv model.Invite
+	var revoked int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT code, max_uses, used, expires_at, created_at, revoked, note FROM invites WHERE code = "+b.ph(1), code).
+		Scan(&inv.Code, &inv.MaxUses, &inv.Used, &inv.ExpiresAt, &inv.CreatedAt, &revoked, &inv.Note)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	inv.Revoked = revoked != 0
+	return &inv, nil
+}
+
+func (b *base) ListInvites(ctx context.Context) ([]model.Invite, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT code, max_uses, used, expires_at, created_at, revoked, note FROM invites ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Invite
+	for rows.Next() {
+		var inv model.Invite
+		var revoked int
+		if err := rows.Scan(&inv.Code, &inv.MaxUses, &inv.Used, &inv.ExpiresAt, &inv.CreatedAt, &revoked, &inv.Note); err != nil {
+			return nil, err
+		}
+		inv.Revoked = revoked != 0
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
+// UseInvite атомарно «тратит» одну активацию приглашения: увеличивает счётчик
+// только если приглашение не отозвано, не просрочено и лимит не исчерпан.
+// Возвращает false, если приглашение недействительно (или его нет).
+func (b *base) UseInvite(ctx context.Context, code string) (bool, error) {
+	res, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"UPDATE invites SET used = used + 1 WHERE code = "+b.ph(1)+
+			" AND revoked = 0"+
+			" AND (max_uses <= 0 OR used < max_uses)"+
+			" AND (expires_at = '' OR expires_at > "+b.ph(2)+")",
+		code, nowStr())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (b *base) RevokeInvite(ctx context.Context, code string) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"UPDATE invites SET revoked = 1 WHERE code = "+b.ph(1), code)
+	return err
+}
+
+func (b *base) DeleteInvite(ctx context.Context, code string) error {
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, err := b.db.ExecContext(ctx, "DELETE FROM invites WHERE code = "+b.ph(1), code)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Автосписание
+// ---------------------------------------------------------------------------
+
+// SetAutoPay создаёт или перезаписывает запись автосписания пользователя.
+// UpdateAutoPaySnapshot атомарно меняет ТОЛЬКО снимок автосписания: полная
+// перезапись строки (SetAutoPay) в этом месте гонялась бы с параллельным
+// выключением автопродления пользователем и молча включала бы его обратно.
+func (b *base) UpdateAutoPaySnapshot(ctx context.Context, telegramID int64, snap *model.PlanSnapshot) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"UPDATE autopay SET plan_snapshot = "+b.ph(1)+" WHERE telegram_id = "+b.ph(2),
+		snap.Encode(), telegramID)
+	return err
+}
+
+func (b *base) SetAutoPay(ctx context.Context, ap *model.AutoPay) error {
+	if ap.CreatedAt == "" {
+		ap.CreatedAt = nowStr()
+	}
+	if ap.Method == "" {
+		ap.Method = model.PayMethodYooKassa
+	}
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"INSERT INTO autopay (telegram_id, method, method_id, title, months, amount, currency, enabled, created_at, last_pay_at, paid_period, next_try_at, fails, last_error, plan_snapshot) "+
+			"VALUES ("+b.ph(1)+", "+b.ph(2)+", "+b.ph(3)+", "+b.ph(4)+", "+b.ph(5)+", "+b.ph(6)+", "+b.ph(7)+", "+b.ph(8)+", "+b.ph(9)+", "+b.ph(10)+", "+b.ph(11)+", "+b.ph(12)+", "+b.ph(13)+", "+b.ph(14)+", "+b.ph(15)+") "+
+			"ON CONFLICT (telegram_id) DO UPDATE SET method = excluded.method, method_id = excluded.method_id, "+
+			"title = excluded.title, months = excluded.months, amount = excluded.amount, currency = excluded.currency, "+
+			"enabled = excluded.enabled, last_pay_at = excluded.last_pay_at, paid_period = excluded.paid_period, "+
+			"next_try_at = excluded.next_try_at, fails = excluded.fails, last_error = excluded.last_error, "+
+			"plan_snapshot = excluded.plan_snapshot",
+		ap.TelegramID, ap.Method, ap.MethodID, ap.Title, ap.Months, ap.Amount, ap.Currency,
+		boolToInt(ap.Enabled), ap.CreatedAt, ap.LastPayAt, ap.PaidPeriod, ap.NextTryAt, ap.Fails, ap.LastError,
+		ap.Snapshot.Encode())
+	return err
+}
+
+func (b *base) GetAutoPay(ctx context.Context, telegramID int64) (*model.AutoPay, error) {
+	var ap model.AutoPay
+	var enabled int
+	var snapRaw string
+	err := b.db.QueryRowContext(ctx,
+		"SELECT "+autoPayCols+" FROM autopay WHERE telegram_id = "+b.ph(1), telegramID).
+		Scan(&ap.TelegramID, &ap.Method, &ap.MethodID, &ap.Title, &ap.Months, &ap.Amount, &ap.Currency,
+			&enabled, &ap.CreatedAt, &ap.LastPayAt, &ap.PaidPeriod, &ap.NextTryAt, &ap.Fails, &ap.LastError, &snapRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ap.Enabled = enabled != 0
+	ap.Snapshot = model.DecodePlanSnapshot(snapRaw)
+	return &ap, nil
+}
+
+func (b *base) SetAutoPayEnabled(ctx context.Context, telegramID int64, on bool) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"UPDATE autopay SET enabled = "+b.ph(1)+", fails = 0, last_error = '', next_try_at = '' WHERE telegram_id = "+b.ph(2),
+		boolToInt(on), telegramID)
+	return err
+}
+
+// UpdateAutoPayResult записывает исход попытки списания.
+func (b *base) UpdateAutoPayResult(ctx context.Context, telegramID int64, lastPayAt, nextTryAt string, fails int, lastError string) error {
+	_, err := b.db.ExecContext(ctx,
+		// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+		"UPDATE autopay SET last_pay_at = "+b.ph(1)+", next_try_at = "+b.ph(2)+", fails = "+b.ph(3)+", last_error = "+b.ph(4)+
+			" WHERE telegram_id = "+b.ph(5),
+		lastPayAt, nextTryAt, fails, lastError, telegramID)
+	return err
+}
+
+// MarkAutoPayCharged фиксирует состоявшееся списание: за какой период списали
+// (защита от повторной оплаты того же периода), когда и с каким исходом
+// продления. Счётчик неудач сбрасывается — деньги-то прошли.
+func (b *base) MarkAutoPayCharged(ctx context.Context, telegramID int64, lastPayAt, paidPeriod, nextTryAt, lastError string) error {
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, err := b.db.ExecContext(ctx,
+		"UPDATE autopay SET last_pay_at = "+b.ph(1)+", paid_period = "+b.ph(2)+", next_try_at = "+b.ph(3)+
+			", fails = 0, last_error = "+b.ph(4)+" WHERE telegram_id = "+b.ph(5),
+		lastPayAt, paidPeriod, nextTryAt, lastError, telegramID)
+	return err
+}
+
+func (b *base) ListAutoPay(ctx context.Context) ([]model.AutoPay, error) {
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT "+autoPayCols+" FROM autopay ORDER BY telegram_id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.AutoPay
+	for rows.Next() {
+		var ap model.AutoPay
+		var enabled int
+		var snapRaw string
+		if err := rows.Scan(&ap.TelegramID, &ap.Method, &ap.MethodID, &ap.Title, &ap.Months, &ap.Amount, &ap.Currency,
+			&enabled, &ap.CreatedAt, &ap.LastPayAt, &ap.PaidPeriod, &ap.NextTryAt, &ap.Fails, &ap.LastError, &snapRaw); err != nil {
+			return nil, err
+		}
+		ap.Enabled = enabled != 0
+		ap.Snapshot = model.DecodePlanSnapshot(snapRaw)
+		out = append(out, ap)
+	}
+	return out, rows.Err()
+}
+
+func (b *base) DeleteAutoPay(ctx context.Context, telegramID int64) error {
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	_, err := b.db.ExecContext(ctx, "DELETE FROM autopay WHERE telegram_id = "+b.ph(1), telegramID)
+	return err
+}
+
+// WhitelistAllUsers выдаёт доступ всем уже зарегистрированным пользователям.
+// Нужно при закрытии ранее публичного бота: иначе смена режима мгновенно
+// отрезала бы действующих клиентов. Возвращает число затронутых строк.
+func (b *base) WhitelistAllUsers(ctx context.Context) (int64, error) {
+	res, err := b.db.ExecContext(ctx, "UPDATE users SET whitelisted = 1 WHERE whitelisted = 0")
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return n, nil
+}
+
+// ClearWhitelistAll снимает доступ со всех разом — операция, обратная
+// WhitelistAllUsers. Без неё закрытый бот не закрыть: доступ выдаётся всей базе
+// одним движением, а снимается только поштучно. Админа не касается: он ходит
+// мимо проверки доступа. Возвращает число затронутых строк.
+func (b *base) ClearWhitelistAll(ctx context.Context) (int64, error) {
+	res, err := b.db.ExecContext(ctx, "UPDATE users SET whitelisted = 0 WHERE whitelisted = 1")
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ClearWhitelistIDs опустошает предзаполненный список. Идёт в паре с
+// ClearWhitelistAll: иначе «снять доступ у всех» не считается — заранее
+// добавленный ID вернул бы человеку доступ при первом же входе.
+func (b *base) ClearWhitelistIDs(ctx context.Context) (int64, error) {
+	res, err := b.db.ExecContext(ctx, "DELETE FROM whitelist")
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// BalanceHeld — сколько денег лежит на балансах и у скольких человек. Нужно
+// админу перед выключением пополнения: решать вслепую он не должен.
+func (b *base) BalanceHeld(ctx context.Context) (int64, int, error) {
+	var sum int64
+	var n int
+	err := b.db.QueryRowContext(ctx,
+		"SELECT COALESCE(SUM(balance), 0), COUNT(*) FROM users WHERE balance > 0").Scan(&sum, &n)
+	return sum, n, err
+}
+
+// ListWhitelistedUsers — постранично те, у кого доступ есть на самом деле.
+// Экран «белый список» раньше показывал только предзаполненные ID, а они по
+// устройству опустошаются при первом входе, поэтому список всегда выглядел
+// пустым, даже когда доступ был у всей базы.
+func (b *base) ListWhitelistedUsers(ctx context.Context, limit, offset int) ([]model.User, int, error) {
+	if limit <= 0 {
+		limit = usersSearchLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int
+	if err := b.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM users WHERE whitelisted = 1").Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	// #nosec G202 -- b.ph выдаёт только placeholder драйвера ($1/?), значения передаются биндовыми параметрами
+	rows, err := b.db.QueryContext(ctx,
+		"SELECT telegram_id, username, first_name, p2p_approved, blocked, created_at FROM users "+
+			"WHERE whitelisted = 1 ORDER BY created_at DESC, telegram_id DESC LIMIT "+b.ph(1)+" OFFSET "+b.ph(2),
+		limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.User
+	for rows.Next() {
+		var u model.User
+		var approved, blocked int
+		if err := rows.Scan(&u.TelegramID, &u.Username, &u.FirstName, &approved, &blocked, &u.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		u.P2PApproved = approved != 0
+		u.Blocked = blocked != 0
+		u.Whitelisted = true
+		out = append(out, u)
+	}
+	return out, total, rows.Err()
+}
+
+// CountWhitelisted — сколько пользователей уже имеют доступ (в т.ч. впущенные
+// по приглашению).
+func (b *base) CountWhitelisted(ctx context.Context) (int, error) {
+	var n int
+	err := b.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE whitelisted = 1").Scan(&n)
+	return n, err
+}

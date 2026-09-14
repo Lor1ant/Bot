@@ -1,0 +1,1 @@
+ALTER TABLE pending_invoices ADD COLUMN kopecks INTEGER NOT NULL DEFAULT 0

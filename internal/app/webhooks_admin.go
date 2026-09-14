@@ -1,0 +1,307 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/go-telegram/bot/models"
+
+	"remnabot/internal/i18n"
+)
+
+// webhookListenPortNum returns the numeric listen port (default 8080).
+func (a *App) webhookListenPortNum() int {
+	p := a.webhookListenPort()
+	n, err := strconv.Atoi(p)
+	if err != nil || n <= 0 || n > 65535 {
+		return 8080
+	}
+	return n
+}
+
+func (a *App) webhookListenPort() string {
+	addr := ":8080"
+	a.mu.Lock()
+	if a.botCfg != nil && a.botCfg.Webhook.ListenAddr != "" {
+		addr = a.botCfg.Webhook.ListenAddr
+	}
+	a.mu.Unlock()
+	// Через разбор, а не «хвост после двоеточия». Иначе экран показывал
+	// сохранённый мусор, а compose переписывался на 8080 — два разных числа
+	// на соседних экранах.
+	if _, port, ok := splitListenAddr(addr); ok {
+		return strconv.Itoa(port)
+	}
+	return "8080"
+}
+
+// normalizeListenAddr приводит ввод админа к каноническому виду и говорит,
+// годится ли он вообще. Хост сохраняется как есть: привязка к 127.0.0.1
+// внутри контейнера — осмысленный сценарий, и терять её нельзя.
+func normalizeListenAddr(in string) (string, bool) {
+	host, port, ok := splitListenAddr(in)
+	if !ok {
+		return "", false
+	}
+	// JoinHostPort, а не склейка: IPv6-адрес обязан остаться в скобках.
+	// Голая склейка давала «:::8080» из «[::]:8080», и веб-сервер не
+	// поднимался вовсе — «too many colons in address».
+	return net.JoinHostPort(host, strconv.Itoa(port)), true
+}
+
+// splitListenAddr разбирает «18080», «:18080», «0.0.0.0:18080».
+func splitListenAddr(in string) (host string, port int, ok bool) {
+	in = strings.TrimSpace(in)
+	if in == "" {
+		return "", 0, false
+	}
+	portStr := in
+	if strings.Contains(in, ":") {
+		h, p, err := net.SplitHostPort(in)
+		if err != nil {
+			return "", 0, false
+		}
+		host, portStr = h, p
+	}
+	n, err := strconv.Atoi(portStr)
+	if err != nil || n < 1 || n > 65535 {
+		return "", 0, false
+	}
+	return host, n, true
+}
+
+func (a *App) selfContainerName() string {
+	if a.ctl != nil {
+		if n := a.ctl.SelfContainer(); n != "" {
+			return n
+		}
+	}
+	return "remnabot"
+}
+
+func (a *App) showWebhooksAdmin(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+
+	a.mu.Lock()
+	base := ""
+	rwSecret := ""
+	domain := ""
+	tls := false
+	if a.botCfg != nil {
+		base = a.botCfg.Webhook.PublicBaseURL
+		rwSecret = a.botCfg.Webhook.RemnawaveSecret
+		domain = a.botCfg.Webhook.Domain
+		tls = a.botCfg.Webhook.TLS
+	}
+	a.mu.Unlock()
+	if tls && domain != "" {
+		base = "https://" + domain
+	}
+
+	secretDisp := i18n.T(lang, "admin.no")
+	if rwSecret != "" {
+		secretDisp = i18n.T(lang, "admin.yes")
+	}
+	pubLabel := i18n.T(lang, "wh.public_off")
+	if tls {
+		pubLabel = i18n.T(lang, "wh.public_on")
+	}
+	domainDisp := domain
+	if domainDisp == "" {
+		domainDisp = i18n.T(lang, "admin.none")
+	}
+
+	urls := ""
+	if base != "" {
+		urls = "\n\n" + i18n.T(lang, "wh.urls",
+			base+"/webhook/yookassa", base+"/webhook/cryptobot",
+			base+"/webhook/platega", base+"/webhook/heleket", base+"/webhook/tribute")
+	}
+
+	text := i18n.T(lang, "wh.screen", a.selfContainerName(), a.webhookListenPort(), pubLabel, domainDisp, secretDisp) + urls +
+		"\n\n" + i18n.T(lang, "wh.torrent_line") + "\n" + i18n.T(lang, "wh.torrent_moved")
+
+	a.sendSysKB(ctx, chatID, text, [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "wh.btn_guide"), "wh:guide")},
+		{btn(i18n.T(lang, "wh.btn_public"), "wh:public"), btn(i18n.T(lang, "wh.btn_domain"), "wh:domain")},
+		{btn(i18n.T(lang, "wh.btn_apply"), "wh:apply")},
+		{btn(i18n.T(lang, "wh.btn_port"), "wh:addr")},
+		{btn(i18n.T(lang, "wh.btn_base"), "wh:base"), btn(i18n.T(lang, "admin.wh_btn_secret"), "wh:secret")},
+		{btn(i18n.T(lang, "btn.back"), "menu:system"), btn(i18n.T(lang, "btn.home"), "menu:home")},
+	})
+}
+
+func (a *App) showWebhookGuide(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	c := a.selfContainerName()
+	p := a.webhookListenPort()
+	caddy := fmt.Sprintf("handle /webhook/* {\n    reverse_proxy %s:%s\n}", c, p)
+	nginx := fmt.Sprintf("location /webhook/ {\n    proxy_pass http://%s:%s;\n    proxy_set_header Host $host;\n}", c, p)
+	text := i18n.T(lang, "wh.guide_intro", c, p) +
+		"\n\n<b>Caddy</b>\n<pre>" + caddy + "</pre>" +
+		"\n<b>nginx</b>\n<pre>" + nginx + "</pre>\n\n" +
+		i18n.T(lang, "wh.guide_after")
+	a.sendKB(ctx, chatID, text, [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "btn.back"), "menu:webhooks"), btn(i18n.T(lang, "btn.home"), "menu:home")},
+	})
+}
+
+func (a *App) onWebhooksAdmin(ctx context.Context, chatID int64, val string) {
+	action, _, _ := strings.Cut(val, ":")
+	lang := a.lang(chatID)
+	switch action {
+	case "guide":
+		a.showWebhookGuide(ctx, chatID)
+	case "base":
+		a.getUI(chatID).adminInput = "wh_base"
+		a.askInput(ctx, chatID, i18n.T(lang, "admin.wh_ask_base"), "menu:webhooks")
+	case "tadm", "tusr":
+		// Кнопки переехали в «Пользователи → Торренты», но у админа в чате
+		// могли остаться старые сообщения: молчаливый no-op выглядел бы как
+		// сломанный тумблер.
+		a.showTorrentAdmin(ctx, chatID)
+	case "secret":
+		a.getUI(chatID).adminInput = "wh_secret"
+		a.askInput(ctx, chatID, i18n.T(lang, "admin.wh_ask_secret"), "menu:webhooks")
+	case "public":
+		a.mu.Lock()
+		if a.botCfg != nil {
+			a.botCfg.Webhook.TLS = !a.botCfg.Webhook.TLS
+		}
+		a.mu.Unlock()
+		_ = a.saveBotConfig(ctx)
+		a.showWebhooksAdmin(ctx, chatID)
+	case "domain":
+		a.getUI(chatID).adminInput = "wh_domain"
+		a.askInput(ctx, chatID, i18n.T(lang, "wh.ask_domain"), "menu:webhooks")
+	case "addr":
+		a.getUI(chatID).adminInput = "wh_addr"
+		a.askInput(ctx, chatID, i18n.T(lang, "wh.ask_addr"), "menu:webhooks")
+	case "apply":
+		a.applyWebhookServer(ctx, chatID)
+	}
+}
+
+func (a *App) applyWebhookServer(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.mu.Lock()
+	tls := a.botCfg != nil && a.botCfg.Webhook.TLS
+	domain := ""
+	if a.botCfg != nil {
+		domain = a.botCfg.Webhook.Domain
+	}
+	a.mu.Unlock()
+	if !tls || domain == "" {
+		a.sendHome(ctx, chatID, i18n.T(lang, "wh.apply_need_domain"))
+		return
+	}
+	if a.ctl == nil || !a.ctl.Available() {
+		a.sendHome(ctx, chatID, i18n.T(lang, "wh.apply_unavailable"))
+		return
+	}
+	// Pre-flight: if host ports 80/443 are already taken (FastPanel/nginx, the
+	// panel proxy, etc.), publishing them would fail to bind and crash-loop the
+	// bot. Refuse here and steer the admin to option A (behind the proxy).
+	if busy, err := a.ctl.WebhookPortsBusy(ctx); err == nil && len(busy) > 0 {
+		ports := ""
+		for i, p := range busy {
+			if i > 0 {
+				ports += ", "
+			}
+			ports += strconv.Itoa(p)
+		}
+		a.sendHome(ctx, chatID, i18n.T(lang, "wh.apply_ports_busy", ports))
+		return
+	}
+	msgID := a.msg.SendKB(ctx, chatID, a.applyPremium(i18n.T(lang, "wh.applying")), nil)
+	marker := filepath.Join(a.cfg.DataDir, "webhook.pending")
+	_ = os.WriteFile(marker, []byte(strconv.FormatInt(chatID, 10)+":"+strconv.Itoa(msgID)), 0o600)
+	if err := a.ctl.PublishWebhookPorts(ctx); err != nil {
+		_ = os.Remove(marker)
+		a.sendHome(ctx, chatID, i18n.T(lang, "wh.apply_fail", err.Error()))
+		return
+	}
+}
+
+func (a *App) cleanupWebhookApplyMsg(ctx context.Context) {
+	marker := filepath.Join(a.cfg.DataDir, "webhook.pending")
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(marker)
+	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+	if len(parts) != 2 {
+		return
+	}
+	chatID, _ := strconv.ParseInt(parts[0], 10, 64)
+	msgID, _ := strconv.Atoi(parts[1])
+	if chatID != 0 && msgID != 0 && a.msg != nil {
+		a.msg.Delete(ctx, chatID, msgID)
+	}
+	if chatID != 0 {
+		a.sendHome(ctx, chatID, i18n.T(a.lang(chatID), "wh.applied"))
+	}
+}
+
+// applyBotPort publishes the configured listen port on a host loopback address
+// and recreates the container so an external reverse proxy can reach the bot.
+// Mirrors applyWebhookServer: refuses if the port is busy, otherwise restarts
+// via hostctl and reports the result after the container comes back.
+func (a *App) applyBotPort(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	port := a.webhookListenPortNum()
+	if a.ctl == nil || !a.ctl.Available() {
+		// Can't self-manage docker — fall back to manual instructions.
+		a.sendHome(ctx, chatID, i18n.T(lang, "wh.port_manual", port))
+		return
+	}
+	if busy, err := a.ctl.PortsBusy(ctx, port); err == nil && len(busy) > 0 {
+		a.sendHome(ctx, chatID, i18n.T(lang, "wh.port_busy", port))
+		return
+	}
+	msgID := a.msg.SendKB(ctx, chatID, a.applyPremium(i18n.T(lang, "wh.port_applying", port)), nil)
+	marker := filepath.Join(a.cfg.DataDir, "botport.pending")
+	_ = os.WriteFile(marker, []byte(strconv.FormatInt(chatID, 10)+":"+strconv.Itoa(msgID)), 0o600)
+	if err := a.ctl.PublishBotPort(ctx, port); err != nil {
+		_ = os.Remove(marker)
+		a.sendHome(ctx, chatID, i18n.T(lang, "wh.apply_fail", err.Error()))
+		return
+	}
+}
+
+// cleanupBotPortMsg runs on startup after a port-change restart: it removes the
+// "applying" message and confirms the new port is live.
+func (a *App) cleanupBotPortMsg(ctx context.Context) {
+	marker := filepath.Join(a.cfg.DataDir, "botport.pending")
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(marker)
+	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+	if len(parts) != 2 {
+		return
+	}
+	chatID, _ := strconv.ParseInt(parts[0], 10, 64)
+	msgID, _ := strconv.Atoi(parts[1])
+	if chatID != 0 && msgID != 0 && a.msg != nil {
+		a.msg.Delete(ctx, chatID, msgID)
+	}
+	if chatID != 0 {
+		a.sendHome(ctx, chatID, i18n.T(a.lang(chatID), "wh.port_applied", a.webhookListenPortNum()))
+	}
+}
+
+// strikeLabel — подпись порога автоблокировки на кнопке: число или «выкл».
+func strikeLabel(lang string, n int) string {
+	if n <= 0 {
+		return i18n.T(lang, "wh.tor_strike_off")
+	}
+	return strconv.Itoa(n)
+}

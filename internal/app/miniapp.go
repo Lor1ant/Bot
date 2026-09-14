@@ -1,0 +1,470 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"strings"
+	"time"
+
+	"remnabot/internal/i18n"
+	"remnabot/internal/model"
+	"remnabot/internal/remnawave"
+	"remnabot/internal/storage"
+	"remnabot/internal/web"
+)
+
+// This file implements web.MiniProvider: thin, read-mostly adapters that expose
+// the bot's EXISTING data/predicates to the Mini App API. No business logic is
+// duplicated here — every value mirrors what the chat bot already computes, so
+// the Mini App can never offer an action the bot doesn't have.
+
+// MiniEnabled reports the Mini App feature flag.
+func (a *App) MiniEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.botCfg != nil && a.botCfg.MiniApp.Enabled
+}
+
+// MiniBotToken returns the Telegram bot token (used for init-data validation).
+func (a *App) MiniBotToken() string { return a.cfg.BotToken }
+
+// MiniMe returns the user's basic profile (balance, language).
+func (a *App) MiniMe(ctx context.Context, tgID int64) web.MiniMeDTO {
+	dto := web.MiniMeDTO{TgID: tgID, Lang: a.lang(tgID)}
+	if a.store != nil {
+		if u, _ := a.store.GetUser(ctx, tgID); u != nil {
+			dto.BalanceK = u.Balance
+			dto.Name = displayName(u.FirstName, u.Username)
+		}
+		// Знак идентификатора больше не признак «аккаунт по почте»: после
+		// привязки Telegram у аккаунта и положительный идентификатор, и почта.
+		if wu, _ := a.store.GetWebUserByTgID(ctx, tgID); wu != nil {
+			dto.Email = wu.Email
+		}
+	}
+	return dto
+}
+
+// MiniMenu mirrors navRow: it reports exactly which actions the chat bot would
+// offer this user, plus the enabled payment methods and contact links.
+func (a *App) MiniMenu(ctx context.Context, tgID int64, web_ bool) web.MiniMenuDTO {
+	dto := web.MiniMenuDTO{
+		HasSub:         a.userHasSub(ctx, tgID),
+		TrialAvailable: a.trialAvailable(ctx, tgID),
+		ReferralOn:     a.referralCfg().Enabled,
+		TopUpOn:        a.topUpEnabled(),
+		SupportURL:     a.supportURL(),
+	}
+	if dto.HasSub {
+		dto.CanRenew = a.renewEligible(ctx, tgID)
+	}
+	dto.Legal = a.miniLegalDocs(tgID)
+	if len(dto.Legal) > 0 {
+		cfgLegal := a.legalCfg()
+		dto.LegalOnPay = cfgLegal.OnPay
+		dto.LegalInMenu = cfgLegal.InMenu
+		dto.LegalGateStart = cfgLegal.GateStart
+		dto.LegalAccept = a.legalRequired(ctx, tgID)
+	}
+	a.mu.Lock()
+	if a.botCfg != nil {
+		c := a.botCfg
+		dto.GroupURL = c.Contact.GroupURL
+		if c.Stars.Enabled && !web_ {
+			dto.PayMethods = append(dto.PayMethods, model.PayMethodStars)
+		}
+		if c.YooKassa.Enabled {
+			dto.PayMethods = append(dto.PayMethods, model.PayMethodYooKassa)
+		}
+		if c.CryptoBot.Enabled {
+			dto.PayMethods = append(dto.PayMethods, model.PayMethodCryptoBot)
+		}
+		// Platega выставляет счёт только в рублях (см. plGridCurrencyOK):
+		// при нерублёвой сетке способ не показываем, а не показываем и продаём
+		// по курсу один к одному.
+		if c.Platega.Enabled && a.plGridCurrencyOK() {
+			dto.PayMethods = append(dto.PayMethods, model.PayMethodPlatega)
+		}
+		if c.Heleket.Enabled {
+			dto.PayMethods = append(dto.PayMethods, model.PayMethodHeleket)
+		}
+		if c.Tribute.Enabled {
+			dto.PayMethods = append(dto.PayMethods, model.PayMethodTribute)
+		}
+		if c.P2P.Enabled {
+			dto.PayMethods = append(dto.PayMethods, model.PayMethodP2P)
+		}
+	}
+	a.mu.Unlock()
+	return dto
+}
+
+// MiniSubscription mirrors showMySubs: link, expiry, status, and the read-only
+// devices count (only the connected number is sent when no per-user limit).
+func (a *App) MiniSubscription(ctx context.Context, tgID int64) web.MiniSubDTO {
+	a.mu.Lock()
+	panel := a.panel
+	a.mu.Unlock()
+	var dto web.MiniSubDTO
+	if panel == nil {
+		return dto
+	}
+	url, expireAt, status, ok := panel.SubscriptionFull(ctx, tgID)
+	if !ok {
+		return dto
+	}
+	dto.Active = true
+	dto.Status = status
+	dto.SubURL = a.rewriteSub(url)
+	dto.ExpireAt = formatExpire(expireAt, a.lang(tgID))
+	if t, err := time.Parse(time.RFC3339, expireAt); err == nil {
+		dto.ExpireTS = t.Unix()
+	}
+	if info, dok := panel.DevicesByTelegramID(ctx, tgID); dok {
+		dto.DevicesOK = true
+		dto.DevicesUsed = info.Used
+		dto.DeviceLimit = info.Limit
+		dto.HasLimit = info.HasLimit
+		// Тот же набор полей, что и в чате: экран один и тот же, решение о
+		// показе — одно и то же, принято владельцем бота в админке.
+		if cfg := a.devicesConfig(); cfg.Show() {
+			lang := a.lang(tgID)
+			for _, d := range info.List {
+				name, meta := deviceParts(lang, d, cfg)
+				dto.Devices = append(dto.Devices, web.MiniDeviceDTO{Name: name, Meta: meta})
+			}
+		}
+	}
+	// Same add-on state the chat screen shows, so the mini-app and the cabinet
+	// don't hide a доп-сервер that ran out of traffic.
+	if add, aok := a.addSubStatus(ctx, tgID); aok {
+		dto.AddSubOK = true
+		dto.AddSubUsed = add.Used
+		dto.AddSubLimit = add.Limit
+		dto.AddSubExhausted = add.Exhausted
+		dto.AddSubOff = strings.EqualFold(add.Status, remnawave.StatusDisabled)
+		// Название опции — тарифа пользователя (или общее).
+		dto.AddSubName = a.userAddSubName(ctx, tgID)
+	}
+	return dto
+}
+
+// MiniPlans mirrors the chat storefront (showPlans): тарифы, доступные этому
+// покупателю, каждый со своими сроками и условиями.
+func (a *App) MiniPlans(ctx context.Context, tgID int64) web.MiniPlansDTO {
+	var dto web.MiniPlansDTO
+	// Гейт триала — тот же, что в чате: пока триал идёт, витрина закрыта,
+	// чтобы его дни не сгорали (админ может разрешить покупку тумблером).
+	if expireAt, locked := a.trialBuyLock(ctx, tgID); locked {
+		lang := a.lang(tgID)
+		dto.Notice = i18n.T(lang, "buy.trial_locked_plain", formatExpire(expireAt, lang))
+		return dto
+	}
+	// Первая точка гейта доступности — сама витрина: тарифы фильтруются по
+	// покупателю, скрытые «по ссылке» не показываются.
+	plans, _, err := a.storefrontPlans(ctx, tgID)
+	if err != nil {
+		a.log.Warn("мини-апп: тарифы не прочитаны", "err", err, "user", tgID)
+		return dto
+	}
+	lang := a.lang(tgID)
+	fallbackCur := a.pricing().Currency
+	// Снимок последней сделки и конец срока — один раз на витрину, а не на
+	// каждый срок каждого тарифа: зачёт остатка считается чистой функцией.
+	var oldSnap *model.PlanSnapshot
+	oldExpire := ""
+	if a.store != nil {
+		if u, _ := a.store.GetUser(ctx, tgID); u != nil {
+			oldSnap, oldExpire = u.Snapshot, u.SubExpireAt
+		}
+	}
+	for i := range plans {
+		p := &plans[i]
+		pd := web.MiniPlanDTO{
+			Code:        p.Code,
+			Name:        p.Name,
+			Description: p.Description,
+			Icon:        p.Icon,
+			Strategy:    p.Strategy,
+		}
+		if a.planAddSubOn(p) {
+			pd.AddSubName, pd.AddSubDesc = a.addSubTexts(lang, p)
+		}
+		cur := planCurrencyOr(p, fallbackCur)
+		// Лучшая цена за месяц — подсветка «выгодного» (раньше фронт жёстко
+		// подсвечивал третью из четырёх позиций).
+		bestIdx, bestRate := -1, int64(0)
+		for j := range p.Durations {
+			d := &p.Durations[j]
+			if d.Months <= 0 || d.Base == "" {
+				continue
+			}
+			// squadCountries ходит в панель (кэш) и сам берёт a.mu.
+			cs, configs := a.squadCountries(ctx, p.IntSquadsFor(d))
+			var countries []web.MiniCountryDTO
+			for _, c := range cs {
+				countries = append(countries, web.MiniCountryDTO{Flag: c.Flag, Code: c.Code, Name: c.Name})
+			}
+			pd.Durations = append(pd.Durations, web.MiniDurationDTO{
+				Months:    d.Months,
+				Price:     d.Base,
+				Currency:  cur,
+				TrafficGB: p.TrafficGBFor(d),
+				Devices:   p.DeviceLimitFor(d),
+				Countries: countries,
+				Configs:   configs,
+				// Зачёт остатка при смене тарифа — та же математика, что
+				// применит финализация (см. plans_switch.go).
+				SwitchDays: switchCredit(oldSnap, oldExpire, a.planSnapshotOf(p, d, d.Months)),
+			})
+			if k, ok := rubToKopecks(d.Base); ok && k > 0 {
+				rate := k / int64(d.Months)
+				if bestIdx < 0 || rate < bestRate {
+					bestIdx, bestRate = len(pd.Durations)-1, rate
+				}
+			}
+		}
+		if bestIdx >= 0 && len(pd.Durations) > 1 {
+			pd.Durations[bestIdx].Best = true
+		}
+		if len(pd.Durations) == 0 {
+			continue
+		}
+		dto.Plans = append(dto.Plans, pd)
+	}
+	return dto
+}
+
+// MiniTrial activates the free trial (mirrors activateTrial's core). Read of
+// availability uses the same predicate as the chat bot.
+func (a *App) MiniTrial(ctx context.Context, tgID int64) web.MiniActionDTO {
+	link, expireAt, ok, err := a.trialOnce(ctx, tgID)
+	if !ok {
+		return web.MiniActionDTO{Error: "триал недоступен"}
+	}
+	if err != nil {
+		return web.MiniActionDTO{Error: stripHTMLTags(a.clientErr(ctx, tgID, "мини-апп", err))}
+	}
+	return web.MiniActionDTO{OK: true, SubURL: link, ExpireAt: formatExpire(expireAt, a.lang(tgID))}
+}
+
+// miniSale разрешает пару «тариф + срок» из запроса мини-аппа/кабинета в
+// продажу. nil — продавать нечего: неизвестный код, срок снят с продажи,
+// тариф выключен или закрыт этому покупателю. Правила зеркалят чат: витрина
+// такого не предлагает, значит и счёт по прямому запросу не создаётся.
+func (a *App) miniSale(ctx context.Context, tgID int64, code string, months int) *sale {
+	if code == "" || code == model.PlanCodeBase {
+		// Пустой код — старый фронт из кэша: он знает только «Базовый».
+		// Тот же признак, что у витрины: срок без базовой цены снят с продажи.
+		if !a.periodOnSale(months) {
+			return nil
+		}
+		// Гейт здесь — baseSaleAllowed, а не planAccessibleFor: у мини-аппа нет
+		// экрана тарифа по ссылке, поэтому «Базовый» в режиме «по ссылке» из
+		// него не продаётся вовсе (покупка по ссылке живёт в чате).
+		if !a.baseSaleAllowed(ctx, tgID) {
+			return nil
+		}
+		return baseSale(months)
+	}
+	p, err := a.planByCode(ctx, code)
+	if err != nil || p == nil || !p.Enabled {
+		return nil
+	}
+	// «По ссылке» продаётся только со своего экрана в чате: мини-апп такие
+	// тарифы не показывает, и API не должен становиться обходом скрытности.
+	if model.NormalizeAvailability(p.Availability) == model.PlanAvailLink {
+		return nil
+	}
+	if !a.planAccessibleFor(ctx, p, tgID) {
+		return nil
+	}
+	d := p.Duration(months)
+	if d == nil || d.Base == "" {
+		return nil
+	}
+	return &sale{Plan: p, D: d, Months: months}
+}
+
+// SessionVersion — текущее поколение пропусков кабинета и мини-аппа.
+func (a *App) SessionVersion() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg == nil {
+		return 0
+	}
+	return a.botCfg.Cabinet.SessionVer
+}
+
+// MiniLegalRequired — нужно ли принять документы перед действием. Единый гейт
+// для всех ручек мини-аппа и кабинета: точечные проверки внутри отдельных
+// действий оставлены как защита в глубину, но новое действие теперь закрыто
+// само собой.
+func (a *App) MiniLegalRequired(ctx context.Context, tgID int64) bool {
+	return a.legalRequired(ctx, tgID)
+}
+
+// MiniCheckout buys/renews a plan duration. Only the "balance" method
+// completes in-app (reuses finalizePurchase, the same provisioning core as
+// the chat flow); other methods return a payment URL or Redirect=true.
+func (a *App) MiniCheckout(ctx context.Context, tgID int64, plan string, months int, method string, shownPrice string, web_ bool) web.MiniActionDTO {
+	if expireAt, locked := a.trialBuyLock(ctx, tgID); locked {
+		lang := a.lang(tgID)
+		return web.MiniActionDTO{Error: i18n.T(lang, "buy.trial_locked_plain", formatExpire(expireAt, lang))}
+	}
+	// Вторая точка гейта доступности: создание счёта. Без неё авторизованный
+	// пользователь покупал бы тариф, недоступный ему по режиму, прямым
+	// запросом мимо витрины.
+	s := a.miniSale(ctx, tgID, plan, months)
+	if s == nil {
+		return web.MiniActionDTO{Error: "тариф недоступен"}
+	}
+	// Гейт документов — до выбора способа: оплата с баланса и P2P идут мимо
+	// miniPayURLCore, и проверка только там оставляла их без согласия.
+	if a.legalRequired(ctx, tgID) {
+		return web.MiniActionDTO{Error: "сначала примите документы сервиса"}
+	}
+	// Сверка показанной цены с сегодняшней — до всех способов. Список тарифов
+	// фронт кэширует до перезагрузки страницы, поэтому здесь окно расхождения
+	// шире, чем в чате: не секунды, а часы. Молча выставлять другую сумму
+	// нельзя; фронт по этой ошибке перечитывает тарифы.
+	if now := a.saleBase(s); priceMoved(shownPrice, now) {
+		cur := curSuffix(curSymbol(a.pricing().Currency))
+		a.payLog(ctx, "", "", tgID, "price_changed", "было %s стало %s plan=%s months=%d",
+			shownPrice, now, s.planCode(), s.Months)
+		return web.MiniActionDTO{Error: i18n.T(a.lang(tgID), "buy.price_changed", shownPrice+cur, now+cur)}
+	}
+	if method == model.PayMethodP2P {
+		if web_ {
+			return a.MiniP2PWeb(ctx, tgID, s)
+		}
+		return a.MiniP2P(ctx, tgID, s)
+	}
+	if method != model.PayMethodBalance {
+		payURL, invoice, err := a.miniPayURL(ctx, tgID, s, method, web_)
+		if err != nil {
+			return web.MiniActionDTO{Error: stripHTMLTags(a.clientErr(ctx, tgID, "мини-апп", err))}
+		}
+		return web.MiniActionDTO{OK: true, PayURL: payURL, Invoice: invoice}
+	}
+
+	priceStr := a.saleBase(s)
+	kopecks, ok := rubToKopecks(priceStr)
+	// Баланс живёт в рублях: тариф в другой валюте с баланса не продаётся —
+	// иначе «5 $» молча списались бы как «5 ₽».
+	if priceStr == "" || !ok || kopecks <= 0 || !a.saleGridCurrency(s) {
+		return web.MiniActionDTO{Error: "тариф недоступен"}
+	}
+	if a.store == nil {
+		return web.MiniActionDTO{Error: "хранилище недоступно"}
+	}
+	// Запросы веб-сервера конкурентны, в отличие от чата, где апдейты идут по
+	// очереди. Ключ сделки ниже строится из конца срока, ПРОЧИТАННОГО ДО
+	// списания, — а он сдвигается каждой выдачей: второй запрос, успевший
+	// прочитать его после первой выдачи, получал другой ключ и списывал
+	// деньги во второй раз. Замок закрывает окно, а отметка ниже — двойной
+	// тап с паузой, когда ключ уже заведомо разошёлся.
+	buyKey := strconv.FormatInt(tgID, 10) + "|" + s.planCode() + "|" + strconv.Itoa(months)
+	clk := &a.checkoutLk[extLockIndex(buyKey)]
+	clk.Lock()
+	defer clk.Unlock()
+	if a.boughtJustNow(buyKey) {
+		a.payLog(ctx, "balance", "", tgID, "duplicate", "повторное нажатие: покупка только что выполнена")
+		return web.MiniActionDTO{Error: i18n.T(a.lang(tgID), "buy.just_bought")}
+	}
+
+	// Ключ сделки против двойного нажатия. Намерения покупки здесь нет (счёт
+	// из мини-аппа намеренно не перебивает выбор в чате), поэтому момент
+	// различается концом срока ДО покупки.
+	discr := "none"
+	if u, uerr := a.store.GetUser(ctx, tgID); uerr == nil && u != nil {
+		discr = "exp:" + u.SubExpireAt
+	}
+	extID := balanceExtID(tgID, s.planCode(), months, discr)
+	if extID != "" {
+		if done, derr := a.store.PaymentByExtID(ctx, extID); derr == nil && done {
+			a.payLog(ctx, "balance", extID, tgID, "duplicate", "повторный запрос: покупка уже выполнена")
+			return web.MiniActionDTO{Error: "покупка уже выполнена"}
+		}
+	}
+	// Снимок — до списания (как в чате): после DeductBalance любой отказ
+	// означает возврат денег, и лишних причин отказа быть не должно.
+	snap := a.saleSnapshot(s)
+	deducted, err := a.store.DeductBalance(ctx, tgID, kopecks)
+	if err != nil {
+		return web.MiniActionDTO{Error: stripHTMLTags(a.clientErr(ctx, tgID, "мини-апп", err))}
+	}
+	if !deducted {
+		return web.MiniActionDTO{Error: "недостаточно средств на балансе"}
+	}
+	link, expireAt, err := a.finalizePurchase(ctx, tgID, months, "balance", priceStr+curSuffix(curRUB), extID, snap)
+	if err != nil {
+		if errors.Is(err, storage.ErrDuplicateExtID) {
+			a.refundBalance(tgID, kopecks, nil)
+			return web.MiniActionDTO{Error: "покупка уже выполнена"}
+		}
+		a.refundBalance(tgID, kopecks, err)
+		return web.MiniActionDTO{Error: stripHTMLTags(a.clientErr(ctx, tgID, "мини-апп", err))}
+	}
+	a.markBought(buyKey)
+	return web.MiniActionDTO{OK: true, SubURL: link, ExpireAt: formatExpire(expireAt, a.lang(tgID))}
+}
+
+// buyCooldown — сколько после выдачи повтор той же покупки считается двойным
+// нажатием. Полминуты: за это время человек не успевает осознанно захотеть
+// второй такой же период, а палец по кнопке попадает дважды легко.
+const buyCooldown = 30 * time.Second
+
+func (a *App) boughtJustNow(key string) bool {
+	a.thrMu.Lock()
+	defer a.thrMu.Unlock()
+	t, ok := a.recentBuy[key]
+	return ok && time.Since(t) <= buyCooldown
+}
+
+func (a *App) markBought(key string) {
+	now := time.Now()
+	a.thrMu.Lock()
+	defer a.thrMu.Unlock()
+	if a.recentBuy == nil {
+		a.recentBuy = map[string]time.Time{}
+	}
+	for k, t := range a.recentBuy {
+		if now.Sub(t) > buyCooldown {
+			delete(a.recentBuy, k)
+		}
+	}
+	a.recentBuy[key] = now
+}
+
+// miniLegalDocs — документы сервиса для мини-аппа и кабинета: тот же состав,
+// что показывает чат-бот, но текст приведён к безопасной разметке (страницу
+// рисует браузер, а текст задаёт админ).
+func (a *App) miniLegalDocs(tgID int64) []web.MiniLegalDTO {
+	lang := a.lang(tgID)
+	var out []web.MiniLegalDTO
+	for _, it := range a.legalCfg().Docs() {
+		d := web.MiniLegalDTO{Kind: it.Kind, Title: legalDocTitle(lang, it.Kind), URL: it.Doc.URL}
+		if it.Doc.Text != "" {
+			d.HTML = sanitizeLegalHTML(it.Doc.Text)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// MiniAcceptLegal записывает согласие с документами. Из кабинета это
+// единственный способ его дать: у e-mail-аккаунта чата с ботом нет.
+func (a *App) MiniAcceptLegal(ctx context.Context, tgID int64) web.MiniActionDTO {
+	if !a.legalCfg().Any() {
+		return web.MiniActionDTO{OK: true}
+	}
+	if a.store != nil {
+		if err := a.store.SetTermsAccepted(ctx, tgID, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			a.log.Warn("согласие с документами не записано", "err", err, "user", tgID)
+			return web.MiniActionDTO{Error: "не удалось сохранить согласие"}
+		}
+	}
+	return web.MiniActionDTO{OK: true}
+}

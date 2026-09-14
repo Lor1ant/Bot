@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: remnabot
+          POSTGRES_PASSWORD: remnabot
+          POSTGRES_DB: remnabot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U remnabot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_POSTGRES_DSN: postgres://remnabot:remnabot@localhost:5432/remnabot?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.1"
+          cache: true
+      - name: gofmt
+        run: |
+          FMT=$(gofmt -l .)
+          if [ -n "$FMT" ]; then
+            echo "не отформатированы:"; echo "$FMT"; exit 1
+          fi
+      - run: go vet ./...
+      # -race вместо обычного прогона, а не в дополнение: иначе платим за
+      # компиляцию дважды. Гонка в деньгах — это двойное списание, и ловить её
+      # обязана сборка, а не боевая установка.
+      - run: go test -race ./... -count=1
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2

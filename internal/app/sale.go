@@ -1,0 +1,290 @@
+package app
+
+import (
+	"context"
+
+	"remnabot/internal/i18n"
+	"remnabot/internal/model"
+)
+
+// Продажа по выбранному тарифу.
+//
+// Намерение покупки всегда несло код тарифа, но до этого этапа он был всегда
+// «base». Теперь экран тарифа по ссылке пишет в намерение любой код, и все
+// способы оплаты обязаны считать цену и снимать условия С ТОГО ЖЕ тарифа.
+//
+// «Базовый» намеренно продолжает продаваться по сетке цен из конфига (Plan ==
+// nil): на ней держится совместимость с предыдущим образом бота, и менять её
+// источник в этом этапе нельзя. После разворота синхронизации сетка — зеркало
+// «Базового», так что расхождения нет.
+
+// sale — что именно продаём: тариф, длительность и срок.
+type sale struct {
+	// Plan == nil — «Базовый»: цены и лимиты берутся из сетки конфига, как
+	// раньше. Не nil — продажа по строке тарифа.
+	Plan *model.Plan
+	// D — длительность тарифа на Months (для Plan != nil).
+	D      *model.PlanDuration
+	Months int
+	// ShownPrice — цена, напечатанная на кнопках экрана способов оплаты в
+	// момент показа. Пусто — сверять не с чем (старое намерение, продажа не из
+	// намерения). См. priceMoved.
+	ShownPrice string
+}
+
+// planCodeOf — код тарифа из снимка сделки ("" — снимка нет).
+func planCodeOf(s *model.PlanSnapshot) string {
+	if s == nil {
+		return ""
+	}
+	return s.Code
+}
+
+// planCode — код продаваемого тарифа.
+func (s *sale) planCode() string {
+	if s == nil || s.Plan == nil {
+		return model.PlanCodeBase
+	}
+	return s.Plan.Code
+}
+
+// baseSale — продажа «Базового» на months: путь всех старых экранов.
+func baseSale(months int) *sale {
+	return &sale{Months: months}
+}
+
+// saleFor восстанавливает продажу из намерения покупки. nil без ошибки —
+// продавать нечего: выбора нет, срок снят с продажи, тариф выключен, удалён
+// или недоступен покупателю (вторая точка гейта — создание счёта). Ошибка —
+// недоступное хранилище.
+func (a *App) saleFor(ctx context.Context, chatID int64) (*sale, error) {
+	in, err := a.buyIntent(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	if in == nil {
+		return nil, nil
+	}
+	if in.PlanCode == "" || in.PlanCode == model.PlanCodeBase {
+		// Проверяем не только «выбор есть», но и «срок ещё продаётся» и «тариф
+		// доступен»: админ мог убрать цену или сменить режим доступности, пока
+		// экран способов висел в переписке.
+		//
+		// Гейт здесь — planAccessibleFor, а не baseSaleAllowed: у последнего
+		// режим «по ссылке» закрыт (это правило ВИТРИНЫ). Намерение на
+		// «Базовый» в режиме «по ссылке» создаётся только его экраном по
+		// ссылке — витрина в этом режиме намерений не создаёт вовсе.
+		//
+		// Выключенный «Базовый» не продаётся, как и любой другой выключенный
+		// тариф: витрина и продление его прячут, и старая кнопка из переписки
+		// не должна продавать то, что админ остановил.
+		bp := a.basePlanRow(ctx)
+		if bp != nil && !bp.Enabled {
+			return nil, nil
+		}
+		if !a.periodOnSale(in.Months) || !a.planAccessibleFor(ctx, bp, chatID) {
+			return nil, nil
+		}
+		bs := baseSale(in.Months)
+		bs.ShownPrice = in.ShownPrice
+		return bs, nil
+	}
+	p, err := a.planByCode(ctx, in.PlanCode)
+	if err != nil {
+		return nil, err
+	}
+	// Выключенный тариф не продаётся, каким бы ни был режим доступности: это
+	// та же проверка, что и непустая базовая цена у «Базового».
+	if p == nil || !p.Enabled {
+		return nil, nil
+	}
+	d := p.Duration(in.Months)
+	if d == nil || d.Base == "" {
+		return nil, nil
+	}
+	if !a.planAccessibleFor(ctx, p, chatID) {
+		return nil, nil
+	}
+	return &sale{Plan: p, D: d, Months: in.Months, ShownPrice: in.ShownPrice}, nil
+}
+
+// saleOrAsk — продажа из намерения; если продавать нечего, показывает витрину
+// и возвращает nil. Прямой наследник buyMonthsOrAsk: фолбэков «считаем, что
+// месяц» здесь нет и не будет.
+func (a *App) saleOrAsk(ctx context.Context, chatID int64) *sale {
+	s, err := a.saleFor(ctx, chatID)
+	if err != nil {
+		// Хранилище недоступно: витрина замкнула бы человека в круг без единого
+		// слова о причине. Текст ошибки драйвера в чат не отдаём.
+		a.log.Warn("покупка: хранилище недоступно", "err", err, "user", chatID)
+		a.sendHome(ctx, chatID, i18n.T(a.lang(chatID), "err.storage"))
+		return nil
+	}
+	if s == nil {
+		a.notify(ctx, chatID, i18n.T(a.lang(chatID), "buy.choice_expired"))
+		a.showPlans(ctx, chatID)
+		return nil
+	}
+	// Единственная точка, через которую идут ВСЕ способы оплаты в чате, —
+	// здесь и стоит сверка показанной цены с текущей.
+	if a.askPriceMoved(ctx, chatID, s) {
+		return nil
+	}
+	return s
+}
+
+// priceMoved — разошлась ли цена, показанная на кнопке, с сегодняшней.
+//
+// Подпись кнопки рисуется при показе экрана, а сумма списания перечитывается
+// в момент нажатия: между этими моментами админ мог поменять прайс, а экран со
+// способами живёт в переписке сколько угодно. Раньше это означало молчаливое
+// списание другой суммы — человек нажимал «оплатить 150 ₽» и получал
+// «подписка активна», не узнав про 900 ₽.
+//
+// Пустая показанная цена означает «сверять не с чем» (намерение снято до
+// появления поля): тогда поведение прежнее.
+func priceMoved(shown, now string) bool {
+	if shown == "" || now == "" || shown == now {
+		return false
+	}
+	sk, sok := rubToKopecks(shown)
+	nk, nok := rubToKopecks(now)
+	if sok && nok {
+		return sk != nk
+	}
+	// Нерублёвые цены сравниваем как строки: единственная задача — заметить,
+	// что подпись кнопки больше не соответствует продаже.
+	return true
+}
+
+// askPriceMoved — при расхождении цены не списывает молча, а перерисовывает
+// экран способов с новой ценой и говорит, что изменилось. true — продажу надо
+// прервать.
+func (a *App) askPriceMoved(ctx context.Context, chatID int64, s *sale) bool {
+	now := a.saleBase(s)
+	if !priceMoved(s.ShownPrice, now) {
+		return false
+	}
+	lang := a.lang(chatID)
+	cur := curSuffix(curSymbol(a.pricing().Currency))
+	a.payLog(ctx, "", "", chatID, "price_changed", "было %s стало %s plan=%s months=%d",
+		s.ShownPrice, now, s.planCode(), s.Months)
+	a.notify(ctx, chatID, i18n.T(lang, "buy.price_changed", s.ShownPrice+cur, now+cur))
+	// Намерение переписываем новой ценой, чтобы следующее нажатие прошло.
+	if err := a.setBuyIntent(ctx, chatID, s.planCode(), s.Months, now); err != nil {
+		a.log.Warn("намерение покупки не обновлено после смены цены", "err", err, "user", chatID)
+		a.sendHome(ctx, chatID, i18n.T(lang, "err.storage"))
+		return true
+	}
+	a.showMethodsSale(ctx, chatID, s)
+	return true
+}
+
+// saleBase — базовая цена продажи (признак «продаётся» и цена CryptoBot,
+// Heleket и оплаты с баланса).
+func (a *App) saleBase(s *sale) string {
+	if s == nil {
+		return ""
+	}
+	if s.Plan == nil {
+		return a.pricing().Base[s.Months]
+	}
+	return s.D.Base
+}
+
+// saleFiat — цена продажи для способа оплаты (переопределение способа, иначе
+// базовая).
+func (a *App) saleFiat(s *sale, method string) string {
+	if s == nil {
+		return ""
+	}
+	if s.Plan == nil {
+		return a.pricing().Fiat(method, s.Months)
+	}
+	return s.D.Fiat(method)
+}
+
+// saleStars — цена продажи в звёздах (0 — звёздами не продаётся).
+func (a *App) saleStars(s *sale) int {
+	if s == nil {
+		return 0
+	}
+	if s.Plan == nil {
+		return a.pricing().StarPrice(s.Months)
+	}
+	return s.D.Stars
+}
+
+// saleCurrency — валюта продажи. У тарифа без валюты (импорт из чужого файла)
+// берётся валюта сетки: пустая валюта дальше превращалась бы в «RUB» у одних
+// способов и в пустой суффикс у других.
+func (a *App) saleCurrency(s *sale) string {
+	if s == nil || s.Plan == nil || s.Plan.Currency == "" {
+		return a.pricing().Currency
+	}
+	return s.Plan.Currency
+}
+
+// saleGridCurrency — совпадает ли валюта продажи с валютой сетки. Баланс,
+// CryptoBot, Heleket и Platega трактуют базовую цену в валюте сетки (баланс —
+// в рублях): тариф в другой валюте этими способами не продаётся — иначе «5 $»
+// молча списались бы как «5 ₽». ЮKassa передаёт валюту тарифа явно, Stars
+// считают в звёздах — их это не касается.
+func (a *App) saleGridCurrency(s *sale) bool {
+	if s == nil || s.Plan == nil || s.Plan.Currency == "" {
+		return true
+	}
+	g := a.pricing().Currency
+	if s.Plan.Currency == g {
+		return true
+	}
+	// Разные написания рублей («₽» у тарифа, «руб» у сетки) — одна валюта.
+	return rubCurrency(s.Plan.Currency) && rubCurrency(g)
+}
+
+// ykSaleCurrencyOK — сможет ли ЮKassa честно назвать валюту продажи: либо это
+// трёхбуквенный код (уходит как есть), либо рублёвое написание (исторический
+// фолбэк «₽» → RUB). Чужой символ («$») превращался бы в RUB молча — и «5 $»
+// списались бы как 5 ₽.
+func (a *App) ykSaleCurrencyOK(s *sale) bool {
+	cur := a.saleCurrency(s)
+	return currencyCode(cur) || rubCurrency(cur)
+}
+
+// saleSnapshot — условия сделки в момент выставления счёта.
+func (a *App) saleSnapshot(s *sale) *model.PlanSnapshot {
+	if s == nil {
+		return nil
+	}
+	if s.Plan == nil {
+		return a.planSnapshot(s.Months)
+	}
+	return a.planSnapshotOf(s.Plan, s.D, s.Months)
+}
+
+// planSnapshotOf снимает условия сделки со строки тарифа — аналог
+// planSnapshotLocked, читающего сетку конфига.
+func (a *App) planSnapshotOf(p *model.Plan, d *model.PlanDuration, months int) *model.PlanSnapshot {
+	sold := a.planAddSubOn(p)
+	snap := &model.PlanSnapshot{
+		Code:        p.Code,
+		Name:        p.Name,
+		Months:      months,
+		TrafficGB:   p.TrafficGBFor(d),
+		DeviceLimit: p.DeviceLimitFor(d),
+		Strategy:    p.Strategy,
+		IntSquads:   p.IntSquadsFor(d),
+		ExtSquad:    p.ExtSquadFor(d),
+		// Продана ли доп-подписка — часть условий сделки: продление применяет
+		// ровно то, что было продано, а не сегодняшний флаг тарифа.
+		AddSub:   &sold,
+		Currency: p.Currency,
+	}
+	if d != nil {
+		snap.Price = d.Base
+	}
+	if snap.Currency == "" {
+		snap.Currency = a.pricing().Currency
+	}
+	return snap
+}

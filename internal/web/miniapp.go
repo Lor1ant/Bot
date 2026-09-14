@@ -1,0 +1,731 @@
+package web
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// initDataTTL bounds how old Telegram init data may be (anti-replay).
+// initDataTTL — сколько живёт подпись Telegram при обмене на пропуск.
+//
+// Сутки — это верхняя граница из примера референсной библиотеки, а не
+// рекомендация: сама дока Telegram окна не называет и лишь советует проверять
+// auth_date. Мини-апп открывается из чата, подпись по построению свежая, и
+// сутки означали лишь одно — перехваченная подпись сутки конвертировалась в
+// новые пропуска.
+//
+// Окно ОБЯЗАНО быть шире жизни пропуска (jwtTTL): Telegram фиксирует подпись в
+// момент открытия мини-аппа и больше не обновляет её, а фронт при истёкшем
+// пропуске повторяет обмен ТОЙ ЖЕ подписью. Окно короче пропуска делает этот
+// путь недостижимым — человек с открытым мини-аппом упирается в 401 без
+// возможности продолжить.
+const initDataTTL = 2 * time.Hour
+
+// jwtTTL is the lifetime of a Mini App session token.
+const jwtTTL = 30 * time.Minute
+
+// MiniProvider exposes the bot's existing data to the Mini App API as thin,
+// read-mostly DTOs. The Mini App holds NO business logic of its own: every
+// value here mirrors what the chat bot already computes/shows, so the two can
+// never drift. Implemented by *app.App.
+type MiniProvider interface {
+	// MiniEnabled reports whether the Mini App feature flag is on.
+	MiniEnabled() bool
+	// MiniBotToken returns the Telegram bot token (for init-data validation).
+	MiniBotToken() string
+
+	MiniMe(ctx context.Context, tgID int64) MiniMeDTO
+	MiniMenu(ctx context.Context, tgID int64, web bool) MiniMenuDTO
+	MiniSubscription(ctx context.Context, tgID int64) MiniSubDTO
+	MiniPlans(ctx context.Context, tgID int64) MiniPlansDTO
+
+	// MiniTrial activates the free trial (mirrors the chat trial flow).
+	MiniTrial(ctx context.Context, tgID int64) MiniActionDTO
+	// MiniCheckout performs an in-app purchase of the given plan (empty plan
+	// code = «Базовый», как слали старые фронты) for the period+method.
+	// shownPrice — цена, которую фронт НАРИСОВАЛ человеку. Список тарифов
+	// кэшируется до перезагрузки страницы, поэтому показанная цена может
+	// отстать от прайса на часы; списание сверяется с ней.
+	MiniCheckout(ctx context.Context, tgID int64, plan string, months int, method string, shownPrice string, web bool) MiniActionDTO
+
+	// MiniAutoPay reports the user's automatic-renewal state.
+	MiniAutoPay(ctx context.Context, tgID int64) MiniAutoPayDTO
+	// MiniSetAutoPay turns automatic renewal on/off for the user.
+	MiniSetAutoPay(ctx context.Context, tgID int64, on bool) MiniActionDTO
+
+	// MiniReferral returns the user's referral info (mirrors showReferral).
+	MiniReferral(ctx context.Context, tgID int64) MiniReferralDTO
+	// MiniPromo applies a promo code (mirrors the chat promo flow).
+	MiniPromo(ctx context.Context, tgID int64, code string) MiniPromoDTO
+	// MiniTopUpOptions returns preset top-up amounts + enabled methods.
+	MiniTopUpOptions(ctx context.Context, tgID int64) MiniTopUpOptionsDTO
+	// MiniTopUp creates a balance top-up payment (yk/cb) and returns the URL.
+	// web — запрос из браузерного кабинета: ссылка мини-аппа там не работает.
+	MiniTopUp(ctx context.Context, tgID int64, kopecks int64, method string, web bool) MiniActionDTO
+
+	// MiniConnect returns install apps + deeplinks for the user's subscription,
+	// sourced from their subscription page (iOS + Android only).
+	MiniConnect(ctx context.Context, tgID int64) MiniConnectDTO
+
+	// MiniAcceptLegal records the user's consent to the service documents
+	// (same acceptance the chat bot writes).
+	MiniAcceptLegal(ctx context.Context, tgID int64) MiniActionDTO
+
+	// MiniResetDevices rotates the user's credentials and clears all their HWID
+	// devices (mirrors the chat "reset devices" flow). Available in the cabinet too.
+	MiniResetDevices(ctx context.Context, tgID int64) MiniActionDTO
+
+	// --- web cabinet (browser site; reuses everything above except trial) ---
+	CabinetEnabled() bool
+	CabinetPath() string
+	CabinetBotUsername() string
+	CabinetTitle() string
+	CabinetDescription() string
+	CabinetFavicon() string
+	CabinetAntiFP() bool
+	CabinetEnsureUser(ctx context.Context, tgID int64)
+	CabinetEmailRegister(ctx context.Context, email, password string) (int64, error)
+	CabinetEmailLogin(ctx context.Context, email, password string) (int64, error)
+	CabinetGate(ctx context.Context, tgID int64, isEmail bool) error
+	// CabinetAccount — состояние аккаунта для экрана «Аккаунт».
+	CabinetAccount(ctx context.Context, tgID int64) CabinetAccountDTO
+	// CabinetMoneyBlocked — платные действия закрыты до подтверждения почты.
+	CabinetMoneyBlocked(ctx context.Context, tgID int64) bool
+	// MailReady — отправка писем настроена.
+	MailReady() bool
+	CabinetSendVerify(ctx context.Context, tgID int64) error
+	CabinetVerifyEmail(ctx context.Context, token string) error
+	CabinetChangePassword(ctx context.Context, tgID int64, oldPass, newPass string) error
+	CabinetForgotPassword(ctx context.Context, email string)
+	CabinetResetPassword(ctx context.Context, token, newPass string) (int64, error)
+	// CabinetBindTelegram привязывает Telegram к аккаунту, заведённому по
+	// почте, и возвращает его новый (телеграмный) идентификатор.
+	CabinetBindTelegram(ctx context.Context, tgID, newTgID int64) (int64, error)
+	// CabinetBindName сохраняет имя и @username из подписи виджета входа.
+	CabinetBindName(ctx context.Context, tgID int64, username, firstName string)
+	CabinetP2PScreenshot(ctx context.Context, tgID, reqID int64, filename string, data []byte) error
+	// MiniBlocked reports whether the user is blocked by an admin.
+	MiniBlocked(ctx context.Context, tgID int64) bool
+	// MiniAccessDenied reports whether the bot's publicity mode (invite-only /
+	// whitelist) keeps this user out — the Mini App and the cabinet must honour
+	// the same gate as the chat bot.
+	MiniAccessDenied(ctx context.Context, tgID int64) bool
+	// CabinetFlag returns a self-hosted country-flag SVG by ISO code.
+	CabinetFlag(code string) ([]byte, bool)
+	// MiniLegalRequired reports whether the user must accept the service
+	// documents before doing anything but reading them.
+	MiniLegalRequired(ctx context.Context, tgID int64) bool
+	// SessionEpoch — поколение пропусков ОДНОГО аккаунта: растёт при смене
+	// пароля и при привязке Telegram, чтобы выбить чужие сессии, не трогая
+	// остальных.
+	SessionEpoch(ctx context.Context, tgID int64) int
+	// SessionVersion — поколение сессий. Пропуска прежнего поколения
+	// отвергаются: это единственный способ «разлогинить всех», потому что ключ
+	// подписи выведен из токена бота и сам по себе не меняется.
+	SessionVersion() int
+}
+
+type MiniReferralDTO struct {
+	Enabled       bool   `json:"enabled"`
+	Link          string `json:"link,omitempty"`
+	Count         int    `json:"count"`
+	BonusValue    int    `json:"bonus_value"`
+	BonusKind     string `json:"bonus_kind"`
+	OnFirstPay    bool   `json:"on_first_pay"`
+	EarnedKopecks int64  `json:"earned_kopecks"`
+	InviteeKind   string `json:"invitee_kind,omitempty"`
+	InviteeValue  int    `json:"invitee_value"`
+	Percent       int    `json:"percent"`
+}
+
+type MiniPromoDTO struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+
+type MiniAmountDTO struct {
+	Kopecks int64  `json:"kopecks"`
+	Label   string `json:"label"`
+}
+
+type MiniTopUpOptionsDTO struct {
+	Amounts []MiniAmountDTO `json:"amounts"`
+	Methods []string        `json:"methods"`
+}
+
+// MiniActionDTO is the result of an action (trial/checkout): on success it
+// carries the fresh subscription link + expiry; otherwise an error message or
+// a Redirect hint (use the bot for this payment method).
+type MiniActionDTO struct {
+	OK       bool   `json:"ok"`
+	SubURL   string `json:"sub_url,omitempty"`
+	ExpireAt string `json:"expire_at,omitempty"`
+	Error    string `json:"error,omitempty"`
+	Redirect bool   `json:"redirect,omitempty"`
+	// Message is a human-readable note shown on a redirect (e.g. P2P -> bot).
+	Message string `json:"message,omitempty"`
+	// PayURL is set for external methods: a payment page/redirect URL, or a
+	// Telegram invoice link when Invoice=true (front opens it via openInvoice).
+	PayURL  string `json:"pay_url,omitempty"`
+	Invoice bool   `json:"invoice,omitempty"`
+	// P2P web flow: the card to transfer to + the request id the cabinet uploads
+	// a payment screenshot against.
+	P2PCard   string `json:"p2p_card,omitempty"`
+	P2PAmount string `json:"p2p_amount,omitempty"`
+	P2PReqID  int64  `json:"p2p_req_id,omitempty"`
+}
+
+// MiniAutoPayDTO describes automatic renewal for the current user: whether the
+// shop offers it at all, whether it is on for this user, and what will be
+// charged. Days is how many days before expiry the charge happens.
+type MiniAutoPayDTO struct {
+	Available bool   `json:"available"`
+	On        bool   `json:"on"`
+	Months    int    `json:"months,omitempty"`
+	Title     string `json:"title,omitempty"`
+	Days      int    `json:"days"`
+	// CanEnable is true when a saved payment method already exists, so the user
+	// can switch renewal back on without paying again.
+	CanEnable bool `json:"can_enable"`
+}
+
+type MiniMeDTO struct {
+	TgID     int64  `json:"tg_id"`
+	Lang     string `json:"lang"`
+	BalanceK int64  `json:"balance_kopecks"`
+	Name     string `json:"name,omitempty"`
+	Email    string `json:"email,omitempty"`
+}
+
+// CabinetAccountDTO — экран «Аккаунт» веб-кабинета: чем человек входит, что
+// подтверждено и что из-за этого закрыто.
+type CabinetAccountDTO struct {
+	TgID int64  `json:"tg_id"`
+	Name string `json:"name,omitempty"`
+	// Email/HasPassword — есть ли вход по паролю (у аккаунтов, вошедших только
+	// через Telegram, его нет).
+	Email       string `json:"email,omitempty"`
+	HasPassword bool   `json:"has_password"`
+	// EmailVerified — адрес подтверждён по ссылке из письма.
+	EmailVerified bool `json:"email_verified"`
+	// TgLinked — Telegram привязан (или это изначально телеграм-аккаунт).
+	TgLinked bool `json:"tg_linked"`
+	// MailOn — отправка писем настроена. Без неё кабинет не предлагает ни
+	// подтверждение, ни восстановление пароля.
+	MailOn bool `json:"mail_on"`
+	// MoneyBlocked — платные действия закрыты до подтверждения адреса.
+	MoneyBlocked bool `json:"money_blocked"`
+}
+
+// MiniMenuDTO mirrors navRow predicates so the front-end shows exactly the
+// actions the chat bot would show this user.
+type MiniMenuDTO struct {
+	HasSub         bool `json:"has_sub"`
+	CanRenew       bool `json:"can_renew"`
+	TrialAvailable bool `json:"trial_available"`
+	ReferralOn     bool `json:"referral_on"`
+	// TopUpOn — включено ли пополнение баланса. Кошелёк как таковой остаётся:
+	// на баланс приходят реферальные начисления, тратить их можно всегда.
+	TopUpOn    bool     `json:"topup_on"`
+	PayMethods []string `json:"pay_methods"`
+	SupportURL string   `json:"support_url"`
+	GroupURL   string   `json:"group_url"`
+
+	// Legal — документы сервиса (соглашение, политика конфиденциальности) в
+	// том же составе, что показывает чат-бот.
+	Legal []MiniLegalDTO `json:"legal,omitempty"`
+	// LegalAccept — требуется согласие с документами перед покупкой. В
+	// кабинете принять его больше негде: у e-mail-аккаунта чата нет.
+	LegalAccept bool `json:"legal_accept,omitempty"`
+	// LegalOnPay — показывать ссылки на документы на экране оплаты.
+	LegalOnPay bool `json:"legal_on_pay,omitempty"`
+	// LegalInMenu — показывать документы отдельным разделом (тот же тумблер,
+	// что рисует кнопку «Документы» в меню чата).
+	LegalInMenu bool `json:"legal_in_menu,omitempty"`
+	// LegalGateStart — согласие спрашивается на входе, а не только перед
+	// оплатой: мини-апп и кабинет держат тот же гейт, что и чат.
+	LegalGateStart bool `json:"legal_gate_start,omitempty"`
+}
+
+// MiniLegalDTO — один документ сервиса: ссылка на страницу и/или текст,
+// приведённый к безопасной разметке.
+type MiniLegalDTO struct {
+	Kind  string `json:"kind"`
+	Title string `json:"title"`
+	URL   string `json:"url,omitempty"`
+	HTML  string `json:"html,omitempty"`
+}
+
+type MiniSubDTO struct {
+	Active      bool   `json:"active"`
+	Status      string `json:"status"`
+	ExpireAt    string `json:"expire_at"`
+	ExpireTS    int64  `json:"expire_ts,omitempty"`
+	SubURL      string `json:"sub_url"`
+	DevicesUsed int    `json:"devices_used"`
+	DeviceLimit int    `json:"device_limit"`
+	HasLimit    bool   `json:"has_limit"`
+	DevicesOK   bool   `json:"devices_ok"`
+	// Devices — сами устройства, если владелец бота разрешил их показывать.
+	// Пусто — на экране остаётся только счётчик.
+	Devices []MiniDeviceDTO `json:"devices,omitempty"`
+
+	// AddSub* describe the add-on ("доп-сервер") subscription that the
+	// subscription middleware merges into the same link. AddSubOK is false when
+	// the feature is off or the user has none — the front-end shows nothing then.
+	AddSubOK        bool  `json:"addsub_ok"`
+	AddSubUsed      int64 `json:"addsub_used,omitempty"`
+	AddSubLimit     int64 `json:"addsub_limit,omitempty"`
+	AddSubExhausted bool  `json:"addsub_exhausted,omitempty"`
+	AddSubOff       bool  `json:"addsub_off,omitempty"`
+	// AddSubName — название опции по тарифу пользователя (пусто — фронт
+	// показывает стандартное «Доп-сервер»).
+	AddSubName string `json:"addsub_name,omitempty"`
+}
+
+// MiniDeviceDTO — одно подключённое устройство. Сервер уже собрал обе строки
+// по набору полей из админки: фронт ничего не решает и не знает про тумблеры.
+type MiniDeviceDTO struct {
+	Name string `json:"name"`
+	Meta string `json:"meta,omitempty"`
+}
+
+// MiniPlanDTO — один ТАРИФ витрины (v2: раньше это был один срок «Базового»;
+// схема ломающая, фронт обновляется тем же релизом).
+type MiniPlanDTO struct {
+	Code        string `json:"code"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Icon        string `json:"icon,omitempty"`
+	// Strategy — traffic reset strategy ЭТОГО тарифа
+	// (NO_RESET/DAY/WEEK/MONTH/MONTH_ROLLING).
+	Strategy string `json:"strategy,omitempty"`
+	// AddSubName/AddSubDesc — опция доп-подписки тарифа; непустое имя означает
+	// «опция продаётся с тарифом», иначе фронт её не показывает.
+	AddSubName string `json:"addsub_name,omitempty"`
+	AddSubDesc string `json:"addsub_desc,omitempty"`
+	// Durations — продаваемые сроки тарифа.
+	Durations []MiniDurationDTO `json:"durations"`
+}
+
+// MiniDurationDTO — один срок тарифа.
+type MiniDurationDTO struct {
+	Months   int    `json:"months"`
+	Price    string `json:"price"`
+	Currency string `json:"currency"`
+	// TrafficGB is the duration's traffic allowance in GB; 0 means unlimited.
+	TrafficGB int `json:"traffic_gb"`
+	// Devices is the HWID device limit; 0 means no explicit limit (panel
+	// default).
+	Devices int `json:"devices"`
+	// Countries are the distinct countries available to the duration's squads.
+	Countries []MiniCountryDTO `json:"countries,omitempty"`
+	// Configs is the number of inbounds (configs) accessible.
+	Configs int `json:"configs,omitempty"`
+	// Best — сервер отмечает самый выгодный срок (лучшая цена за месяц);
+	// раньше фронт подсвечивал третью позицию из четырёх.
+	Best bool `json:"best,omitempty"`
+	// SwitchDays — зачёт остатка при смене тарифа: на сколько дней сдвинется
+	// конец срока сверх обычного продления (обычно отрицательное при
+	// апгрейде). 0 — зачёта нет (нет активной подписки или тариф тот же).
+	SwitchDays int `json:"switch_days,omitempty"`
+}
+
+// MiniCountryDTO is one destination country available to a plan.
+type MiniCountryDTO struct {
+	Flag string `json:"flag,omitempty"`
+	Code string `json:"code,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+type MiniPlansDTO struct {
+	Plans []MiniPlanDTO `json:"plans"`
+	// Notice — почему витрина пуста (активный триал), текст для экрана.
+	Notice string `json:"notice,omitempty"`
+}
+
+// MiniConnectButtonDTO is one install button (store link) for an app.
+type MiniConnectButtonDTO struct {
+	Text string `json:"text"`
+	URL  string `json:"url"`
+}
+
+// MiniConnectAppDTO is one VPN client app the user can install and import the
+// subscription into via its deeplink.
+type MiniConnectAppDTO struct {
+	ID       string                 `json:"id"`
+	Name     string                 `json:"name"`
+	Featured bool                   `json:"featured,omitempty"`
+	Deeplink string                 `json:"deeplink,omitempty"`
+	AddDesc  string                 `json:"add_desc,omitempty"`
+	Installs []MiniConnectButtonDTO `json:"installs,omitempty"`
+}
+
+// MiniConnectDTO carries the subscription URL plus the iOS/Android app lists.
+type MiniConnectPlatformDTO struct {
+	Key   string              `json:"key"`
+	Label string              `json:"label"`
+	Apps  []MiniConnectAppDTO `json:"apps"`
+}
+
+type MiniConnectDTO struct {
+	SubURL    string                   `json:"sub_url,omitempty"`
+	Username  string                   `json:"username,omitempty"`
+	Platforms []MiniConnectPlatformDTO `json:"platforms,omitempty"`
+	Android   []MiniConnectAppDTO      `json:"android,omitempty"`
+	IOS       []MiniConnectAppDTO      `json:"ios,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// requireAuth extracts and verifies the Bearer JWT, returning the Telegram id.
+func (s *Server) miniAuth(r *http.Request) (id int64, web bool, ok bool) {
+	if s.mini == nil {
+		return 0, false, false
+	}
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, "Bearer ") {
+		return 0, false, false
+	}
+	id, web, epoch, err := parseJWT(strings.TrimPrefix(h, "Bearer "), jwtKey(s.mini.MiniBotToken()), s.mini.SessionVersion())
+	if err != nil {
+		return 0, false, false
+	}
+	// Поколение пропусков аккаунта: смена пароля и привязка Telegram обязаны
+	// выбить прежние сессии немедленно. Общего поколения для этого мало — оно
+	// выбивает всех сразу, поэтому им и не пользуются.
+	if epoch != s.mini.SessionEpoch(r.Context(), id) {
+		return 0, false, false
+	}
+	return id, web, true
+}
+
+// handleMiniAuth exchanges Telegram init data for a short-lived JWT.
+func (s *Server) handleMiniAuth(w http.ResponseWriter, r *http.Request) {
+	if s.mini == nil || !s.mini.MiniEnabled() {
+		http.NotFound(w, r)
+		return
+	}
+	body, err := readAllLimited(r, 16*1024)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		InitData string `json:"init_data"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	tgID, err := validateInitData(req.InitData, s.mini.MiniBotToken(), initDataTTL)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	tok := issueJWT(tgID, false, jwtKey(s.mini.MiniBotToken()), jwtTTL, s.mini.SessionVersion(), s.mini.SessionEpoch(r.Context(), tgID))
+	writeJSON(w, http.StatusOK, map[string]any{"token": tok, "expires_in": int(jwtTTL.Seconds())})
+}
+
+// legalFreePaths — ручки, доступные до принятия документов. Без них человек не
+// смог бы увидеть сами документы и нажать «принимаю» — экран согласия
+// зациклился бы.
+func legalFreePaths(path string) bool {
+	switch path {
+	case "/api/miniapp/me", "/api/miniapp/menu", "/api/miniapp/legal/accept",
+		"/api/miniapp/subscription", "/api/miniapp/connect":
+		return true
+	}
+	return false
+}
+
+// moneyPath — ручки, за которыми стоят деньги или выдача дней. Ровно этот
+// список закрыт до подтверждения почты; чтение подписки, ссылок и документов
+// остаётся доступным, иначе человек не увидел бы даже того, за что уже платил.
+func moneyPath(path string) bool {
+	switch path {
+	case "/api/miniapp/checkout", "/api/miniapp/topup", "/api/miniapp/promo",
+		"/api/miniapp/trial", "/api/miniapp/autopay", "/api/cabinet/p2p/screenshot":
+		return true
+	}
+	return false
+}
+
+func (s *Server) miniGuard(w http.ResponseWriter, r *http.Request) (id int64, web bool, ok bool) {
+	if s.mini == nil || (!s.mini.MiniEnabled() && !s.mini.CabinetEnabled()) {
+		http.NotFound(w, r)
+		return 0, false, false
+	}
+	id, web, ok = s.miniAuth(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return 0, false, false
+	}
+	// Признак поверхности из пропуска сверяется с тем, включена ли она.
+	// Раньше страж пускал, если включена ЛЮБАЯ из двух: админ выключал
+	// кабинет, страница и вход исчезали, а выданные пропуска ещё неделю читали
+	// подписки, создавали счета и тратили баланс — выключатель был иллюзией.
+	// Кабинет пользуется тем же API мини-аппа, поэтому проверка здесь.
+	if web && !s.mini.CabinetEnabled() {
+		http.NotFound(w, r)
+		return 0, false, false
+	}
+	if !web && !s.mini.MiniEnabled() {
+		http.NotFound(w, r)
+		return 0, false, false
+	}
+	if s.mini.MiniBlocked(r.Context(), id) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "доступ заблокирован"})
+		return 0, false, false
+	}
+	if s.mini.MiniAccessDenied(r.Context(), id) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "доступ к боту ограничен"})
+		return 0, false, false
+	}
+	// Модерация кабинета проверяется на КАЖДОМ запросе, а не только на входе:
+	// пропуск живёт семь суток, и без этого отзыв доступа не действовал бы всю
+	// неделю.
+	if web {
+		if err := s.mini.CabinetGate(r.Context(), id, id < 0); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return 0, false, false
+		}
+	}
+	// Гейт документов — одной точкой на все ручки. Раньше он стоял только на
+	// оформлении счёта, и триал, промокод, пополнение и сброс устройств
+	// проходили мимо согласия целиком.
+	if !legalFreePaths(r.URL.Path) && s.mini.MiniLegalRequired(r.Context(), id) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "сначала примите документы сервиса"})
+		return 0, false, false
+	}
+	// Гейт подтверждения почты — тоже одной точкой и ровно на платных ручках.
+	// Аккаунт, чья личность подтверждена только введённым адресом, не должен
+	// ни покупать, ни пополнять, ни гасить промокод: по почте сопоставляются
+	// списки допущенных, и неподтверждённый адрес — это чужой адрес.
+	// Только на записи: у автопродления и промокода по этому же пути живёт
+	// чтение состояния, и закрывать его значило бы ломать экран, который как раз
+	// и объясняет человеку, почему оплата недоступна.
+	if r.Method == http.MethodPost && moneyPath(r.URL.Path) && s.mini.CabinetMoneyBlocked(r.Context(), id) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "подтвердите почту — на неё отправлено письмо"})
+		return 0, false, false
+	}
+	return id, web, true
+}
+
+func (s *Server) handleMiniMe(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniMe(ctx, id))
+}
+
+func (s *Server) handleMiniMenu(w http.ResponseWriter, r *http.Request) {
+	id, web, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniMenu(ctx, id, web))
+}
+
+func (s *Server) handleMiniAcceptLegal(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniAcceptLegal(ctx, id))
+}
+
+func (s *Server) handleMiniSubscription(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniSubscription(ctx, id))
+}
+
+func (s *Server) handleMiniPlans(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniPlans(ctx, id))
+}
+
+func (s *Server) handleMiniTrial(w http.ResponseWriter, r *http.Request) {
+	id, web, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	if web {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "триал недоступен в веб-кабинете"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniTrial(ctx, id))
+}
+
+func (s *Server) handleMiniCheckout(w http.ResponseWriter, r *http.Request) {
+	id, web, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	body, err := readAllLimited(r, 8*1024)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		// Plan — код тарифа; пустой (старый фронт из кэша) = «Базовый».
+		Plan   string `json:"plan"`
+		Months int    `json:"months"`
+		Method string `json:"method"`
+		// Price — цена, показанная на экране оформления. Пусто у старого
+		// фронта из кэша: тогда сверять не с чем и поведение прежнее.
+		Price string `json:"price"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniCheckout(ctx, id, req.Plan, req.Months, req.Method, req.Price, web))
+}
+
+// handleMiniAutoPay returns the user's automatic-renewal state.
+func (s *Server) handleMiniAutoPay(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniAutoPay(ctx, id))
+}
+
+// handleMiniSetAutoPay turns automatic renewal on/off for the user.
+func (s *Server) handleMiniSetAutoPay(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	body, err := readAllLimited(r, 4*1024)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		On bool `json:"on"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniSetAutoPay(ctx, id, req.On))
+}
+
+func (s *Server) handleMiniReferral(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniReferral(ctx, id))
+}
+
+func (s *Server) handleMiniPromo(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	body, err := readAllLimited(r, 4*1024)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniPromo(ctx, id, req.Code))
+}
+
+func (s *Server) handleMiniTopUpOptions(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniTopUpOptions(ctx, id))
+}
+
+func (s *Server) handleMiniTopUp(w http.ResponseWriter, r *http.Request) {
+	id, web, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	body, err := readAllLimited(r, 4*1024)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Kopecks int64  `json:"kopecks"`
+		Method  string `json:"method"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniTopUp(ctx, id, req.Kopecks, req.Method, web))
+}
+
+func (s *Server) handleMiniConnect(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniConnect(ctx, id))
+}
+
+func (s *Server) handleMiniResetDevices(w http.ResponseWriter, r *http.Request) {
+	id, _, ok := s.miniGuard(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mini.MiniResetDevices(ctx, id))
+}

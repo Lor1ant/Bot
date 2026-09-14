@@ -1,0 +1,283 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"remnabot/internal/heleket"
+	"remnabot/internal/i18n"
+	"remnabot/internal/model"
+	"remnabot/internal/storage"
+)
+
+// invoiceSnapRetentionDays — сколько держим условия выставленных счетов Stars.
+// Счёт в переписке оплачиваемым остаётся, но за такой срок цены и лимиты уже
+// точно менялись не раз.
+const invoiceSnapRetentionDays = 30
+
+const (
+	reconcileInterval = 2 * time.Minute
+	reconcileGrace    = 2 * time.Minute
+	reconcileGiveUp   = 24 * time.Hour
+	reconcileBatch    = 50
+)
+
+func (a *App) RunReconciler(ctx context.Context) {
+	t := time.NewTicker(reconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.reconcileOnce(ctx)
+			a.reconcileStars(ctx)
+		}
+	}
+}
+
+func (a *App) reconcileOnce(ctx context.Context) {
+	a.mu.Lock()
+	st := a.store
+	a.mu.Unlock()
+	if st == nil {
+		return
+	}
+	if time.Since(a.payLogPurgedAt) > 24*time.Hour {
+		a.payLogPurgedAt = time.Now()
+		_ = st.PurgePayLogs(ctx, time.Now().UTC().AddDate(0, 0, -90).Format(time.RFC3339))
+		_ = st.PurgeTorrentReports(ctx, time.Now().UTC().Add(-torrentRetention).Format(time.RFC3339))
+		// Условия счетов, которые заведомо уже никто не оплатит.
+		_ = st.PurgeInvoiceSnapshots(ctx, time.Now().UTC().AddDate(0, 0, -invoiceSnapRetentionDays).Format(time.RFC3339))
+		// Ссылки из писем кабинета. Порог с большим запасом: свежие строки
+		// нужны счётчику отправленных писем, по нему считается порог отправки.
+		_ = st.PurgeEmailTokens(ctx, time.Now().UTC().Add(-emailTokenRetention).Format(time.RFC3339))
+	}
+	cutoff := time.Now().UTC().Add(-reconcileGrace).Format(time.RFC3339)
+	list, err := st.ListUnresolvedPending(ctx, cutoff, reconcileBatch)
+	if err != nil {
+		a.log.Warn("reconciler: list pending", "err", err)
+		return
+	}
+	for i := range list {
+		a.reconcileInvoice(ctx, st, &list[i])
+	}
+	a.reconPrune(list)
+}
+
+// reconPrune оставляет в памяти дедупликации только счета, которые всё ещё
+// висят. Чистим одним местом по итогу прохода, а не в каждой ветке закрытия
+// счёта: пропущенная ветка означала бы медленную утечку памяти.
+func (a *App) reconPrune(list []model.PendingInvoice) {
+	alive := make(map[string]struct{}, len(list))
+	for i := range list {
+		alive[list[i].ExtID] = struct{}{}
+	}
+	a.reconMu.Lock()
+	defer a.reconMu.Unlock()
+	for k := range a.reconSeen {
+		if _, ok := alive[k]; !ok {
+			delete(a.reconSeen, k)
+		}
+	}
+}
+
+// reconLog пишет в журнал результат прохода реконсилятора ТОЛЬКО если состояние
+// счёта изменилось с прошлого раза. Иначе один зависший счёт за сутки оставлял
+// 720 одинаковых строк, а сотня таких счетов — 72 тысячи.
+func (a *App) reconLog(ctx context.Context, pi *model.PendingInvoice, stage, state, format string, args ...any) {
+	a.reconMu.Lock()
+	if a.reconSeen == nil {
+		a.reconSeen = map[string]string{}
+	}
+	key := pi.ExtID
+	mark := stage + "=" + state
+	same := a.reconSeen[key] == mark
+	if !same {
+		a.reconSeen[key] = mark
+	}
+	a.reconMu.Unlock()
+	if same {
+		return
+	}
+	a.payLog(ctx, pi.Method, pi.ExtID, pi.TelegramID, stage, format, args...)
+}
+
+func (a *App) reconcileInvoice(ctx context.Context, st storage.Storage, pi *model.PendingInvoice) {
+
+	if t, err := time.Parse(time.RFC3339, pi.CreatedAt); err == nil && time.Since(t) > reconcileGiveUp {
+		a.payLog(ctx, pi.Method, pi.ExtID, pi.TelegramID, "reconcile_giveup", "счёт старше 24ч, снят с проверки")
+		_ = st.ResolvePending(ctx, pi.ID)
+		return
+	}
+
+	if done, _ := st.PaymentByExtID(ctx, pi.ExtID); done {
+		_ = st.ResolvePending(ctx, pi.ID)
+		return
+	}
+	switch pi.Method {
+	case model.PayMethodYooKassa:
+		a.reconcileYooKassa(ctx, st, pi)
+	case model.PayMethodCryptoBot:
+		a.reconcileCryptoBot(ctx, st, pi)
+	case model.PayMethodPlatega:
+		a.reconcilePlatega(ctx, st, pi)
+	case model.PayMethodHeleket:
+		a.reconcileHeleket(ctx, st, pi)
+	default:
+		_ = st.ResolvePending(ctx, pi.ID)
+	}
+}
+
+func (a *App) reconcileYooKassa(ctx context.Context, st storage.Storage, pi *model.PendingInvoice) {
+	client := a.ykClient()
+	if client == nil {
+		a.reconLog(ctx, pi, "reconcile_error", "no-client", "клиент ЮKassa не настроен — счёт нельзя перепроверить")
+		return
+	}
+	pay, err := client.GetPayment(ctx, pi.ExtID)
+	if err != nil {
+		a.reconLog(ctx, pi, "reconcile_error", err.Error(), "%v", err)
+		return
+	}
+	a.reconLog(ctx, pi, "reconcile", pay.Status, "status=%s paid=%v", pay.Status, pay.Paid)
+	if a.ykRefunded(ctx, pi.ExtID, pi.TelegramID, pay) {
+		return
+	}
+	switch {
+	case pay.Status == "succeeded" && pay.Paid:
+		// Платёж мог быть сделан с сохранением карты: если вебхук не дошёл и
+		// оплату добил реконсилятор, предложение про автопродление всё равно
+		// должно уйти — но ровно один раз, только когда подписка реально выдана.
+		if a.reconcileFinalize(ctx, st, pi, pay.Amount.Value+" "+pay.Amount.Currency) {
+			a.saveAutoPayFromPayment(ctx, pi.TelegramID, pi.Months, pay, pi.Snapshot)
+		}
+	case pay.Status == "canceled":
+		_ = st.ResolvePending(ctx, pi.ID)
+	}
+}
+
+func (a *App) reconcileCryptoBot(ctx context.Context, st storage.Storage, pi *model.PendingInvoice) {
+	client := a.cbClient()
+	if client == nil {
+		a.reconLog(ctx, pi, "reconcile_error", "no-client", "клиент CryptoBot не настроен — счёт нельзя перепроверить")
+		return
+	}
+	idStr := strings.TrimPrefix(pi.ExtID, "cb:")
+	invoiceID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		_ = st.ResolvePending(ctx, pi.ID)
+		return
+	}
+	inv, err := client.GetInvoice(ctx, invoiceID)
+	if err != nil {
+		a.reconLog(ctx, pi, "reconcile_error", err.Error(), "%v", err)
+		return
+	}
+	a.reconLog(ctx, pi, "reconcile", inv.Status, "status=%s", inv.Status)
+	switch inv.Status {
+	case "paid":
+		a.reconcileFinalize(ctx, st, pi, a.cryptoAmount(pi.Snapshot, pi.Months, cbAmount(inv.Asset, inv.Amount, inv.PaidAsset, inv.PaidAmount, inv.Fiat)))
+	case "expired":
+		_ = st.ResolvePending(ctx, pi.ID)
+	}
+}
+
+func (a *App) reconcilePlatega(ctx context.Context, st storage.Storage, pi *model.PendingInvoice) {
+	client := a.plClient()
+	if client == nil {
+		a.reconLog(ctx, pi, "reconcile_error", "no-client", "клиент Platega не настроен — счёт нельзя перепроверить")
+		return
+	}
+	tx, err := client.GetTransaction(ctx, pi.ExtID)
+	if err != nil {
+		a.reconLog(ctx, pi, "reconcile_error", err.Error(), "%v", err)
+		return
+	}
+	a.reconLog(ctx, pi, "reconcile", tx.Status, "status=%s", tx.Status)
+	switch {
+	case strings.EqualFold(tx.Status, "CONFIRMED"):
+		a.reconcileFinalize(ctx, st, pi, fmt.Sprintf("%.2f %s", tx.Amount, tx.Currency))
+	case strings.EqualFold(tx.Status, "CANCELED") || strings.EqualFold(tx.Status, "CHARGEBACKED"):
+		_ = st.ResolvePending(ctx, pi.ID)
+	}
+}
+
+func (a *App) reconcileHeleket(ctx context.Context, st storage.Storage, pi *model.PendingInvoice) {
+	client := a.hlClient()
+	if client == nil {
+		a.reconLog(ctx, pi, "reconcile_error", "no-client", "клиент Heleket не настроен — счёт нельзя перепроверить")
+		return
+	}
+	inv, err := client.Info(ctx, strings.TrimPrefix(pi.ExtID, hlExtPrefix))
+	if err != nil {
+		a.reconLog(ctx, pi, "reconcile_error", err.Error(), "%v", err)
+		return
+	}
+	a.reconLog(ctx, pi, "reconcile", inv.Status, "status=%s", inv.Status)
+	switch {
+	case heleket.Successful(inv.Status):
+		a.reconcileFinalize(ctx, st, pi, a.hlAmountLabel(inv))
+	case inv.IsFinal || heleket.Final(inv.Status):
+		// Вебхук мог не дойти — ради этого реконсилятор и нужен, поэтому про
+		// недоплату и AML-заморозку админа зовём и отсюда.
+		switch inv.Status {
+		case heleket.StatusWrongAmount:
+			a.hlNotifyAdmin(ctx, inv, "underpaid")
+		case heleket.StatusLocked:
+			a.hlNotifyAdmin(ctx, inv, "locked")
+		}
+		// Промежуточные статусы (check, confirm_check, wrong_amount_waiting)
+		// счёт не гасят — оплата ещё может дойти.
+		_ = st.ResolvePending(ctx, pi.ID)
+	}
+}
+
+// reconcileFinalize добивает недоставленную оплату. Возвращает true, только
+// если подписка была выдана именно этим вызовом (дубли и ошибки — false), чтобы
+// вызывающий не повторял разовые действия вроде предложения автопродления.
+func (a *App) reconcileFinalize(ctx context.Context, st storage.Storage, pi *model.PendingInvoice, amount string) bool {
+	// Пользователя удалили, а счёт остался незакрытым. Прежде сверка добивала
+	// его и ЗАВОДИЛА человека заново — с деньгами, но без принятых документов,
+	// без допуска к тарифам и без вайтлиста. Удалять счета вместе с
+	// пользователем нельзя: он мог оплатить уже после нажатия «удалить», и
+	// тогда деньги списаны, услуги нет, следов нет. Поэтому не выдаём и не
+	// начисляем, а зовём админа разобраться руками.
+	if u, err := st.GetUser(ctx, pi.TelegramID); err == nil && u == nil {
+		a.payLog(ctx, pi.Method, pi.ExtID, pi.TelegramID, "orphan_paid",
+			"оплата пришла на удалённого пользователя: %s, purpose=%s", amount, pi.Purpose)
+		_ = st.ResolvePending(ctx, pi.ID)
+		alang := a.lang(a.cfg.AdminID)
+		a.notify(ctx, a.cfg.AdminID, i18n.T(alang, "admin.orphan_payment",
+			escapeName(pi.Method), escapeName(pi.ExtID), escapeName(amount), pi.TelegramID))
+		a.log.Warn("сверка: оплата на удалённого пользователя", "method", pi.Method, "ext_id", pi.ExtID)
+		return false
+	}
+	if pi.Purpose == "topup" {
+		if err := a.finalizeTopUp(ctx, pi.TelegramID, pi.Kopecks, pi.Method, amount, pi.ExtID); err != nil &&
+			!errors.Is(err, storage.ErrDuplicateExtID) {
+			a.log.Warn("reconciler: topup", "ext_id", pi.ExtID, "err", err)
+			return false
+		}
+		_ = st.ResolvePending(ctx, pi.ID)
+		return false
+	}
+	link, expireAt, err := a.finalizePurchase(ctx, pi.TelegramID, pi.Months, pi.Method, amount, pi.ExtID, pi.Snapshot)
+	if err != nil {
+
+		if errors.Is(err, storage.ErrDuplicateExtID) {
+			_ = st.ResolvePending(ctx, pi.ID)
+			return false
+		}
+		a.log.Warn("reconciler: finalize", "method", pi.Method, "ext_id", pi.ExtID, "err", err)
+		return false
+	}
+	_ = st.ResolvePending(ctx, pi.ID)
+	a.sendSubActive(ctx, pi.TelegramID, link, expireAt)
+	a.log.Info("reconciler: finalized late payment", "method", pi.Method, "ext_id", pi.ExtID, "chat_id", pi.TelegramID)
+	return true
+}

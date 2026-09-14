@@ -1,0 +1,1 @@
+ALTER TABLE pending_invoices ADD COLUMN purpose TEXT NOT NULL DEFAULT ''

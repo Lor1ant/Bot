@@ -1,0 +1,31 @@
+name: remnachillbot
+
+services:
+  bot:
+    # :v1 — все релизы 1.x.y (без автопрыжка на 2.0.0). Другие варианты:
+    # :latest — всегда свежий релиз, :dev — превью, :v1.0.0 — жёсткий пин.
+    image: ghcr.io/mrvibecodic/chill-remna-bot:v1
+    pull_policy: always
+    container_name: remnabot
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: "ВПИШИТЕ_ТОКЕН_БОТА"
+      ADMIN_TELEGRAM_ID: "ВПИШИТЕ_ВАШ_TELEGRAM_ID"
+      DATA_DIR: /data
+      COMPOSE_PROJECT: remnachillbot
+      COMPOSE_FILE_PATH: /compose/docker-compose.yml
+      COMPOSE_HOST_DIR: /opt/remnachillbot
+      PANEL_CONTAINER: remnawave
+      # Если панель закрыта аддоном «Caddy with security» (docs.rw → Panel security),
+      # впишите сюда X-Api-Key из портала — бот добавит его ко всем запросам к панели.
+      # CADDY_AUTH_API_TOKEN: ""
+    volumes:
+      - bot-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/remnachillbot:/compose
+      # Свой дизайн мини-аппа/кабинета: раскомментируйте и положите файлы в ./custom
+      # (index.html — общий, miniapp.html / cabinet.html — раздельные; см. README)
+      # - /opt/remnachillbot/custom:/custom:ro
+
+volumes:
+  bot-data:

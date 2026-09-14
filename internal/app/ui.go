@@ -1,0 +1,1055 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	_ "embed"
+	"encoding/json"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-telegram/bot/models"
+
+	"remnabot/internal/assets"
+	"remnabot/internal/i18n"
+	"remnabot/internal/model"
+)
+
+//go:embed banner_default.jpg
+var defaultBanner []byte
+
+var botEmojis = []struct{ E, Use string }{
+	{"👋", "приветствие на /start"},
+	{"✅", "подтверждение: «Я оплатил», активация подписки, доступ"},
+	{"❌", "отказ оплаты, ошибка, кнопка «Закрыть»"},
+	{"⏳", "«запускаю обновление…» и другие процессы"},
+	{"🕒", "«скриншот получен, ожидайте подтверждения»"},
+	{"🔒", "P2P: нужно одобрение администратора"},
+	{"📸", "просьба прислать скриншот оплаты"},
+	{"💳", "кнопка «Купить», карта в P2P, методы оплаты"},
+	{"📦", "выбор тарифа, «моя подписка»"},
+	{"📭", "пусто: «нет активных подписок», «тарифы не настроены»"},
+	{"🙏", "«способы оплаты пока не настроены»"},
+	{"🔥", "подсказка «чаще всего выбирают X мес»"},
+	{"⭐", "оплата через Telegram Stars"},
+	{"🎁", "триал, кнопка «🎁 Триал», уведомление об активации"},
+	{"🏠", "кнопка «На главную»"},
+	{"📲", "кнопка «Мои подписки»"},
+	{"👥", "кнопка «Группа» на главной у юзера"},
+	{"🛟", "кнопка «Поддержка» на главной у юзера"},
+	{"📜", "документы сервиса: соглашение и политика конфиденциальности"},
+	{"🚪", "кнопка «Не сейчас» на экране согласия"},
+}
+
+func (a *App) botLang() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.botCfg != nil && a.botCfg.Language != "" {
+		return a.botCfg.Language
+	}
+	return i18n.Fallback
+}
+
+func displayName(first, username string) string {
+	if first != "" {
+		return escapeName(first)
+	}
+	if username != "" {
+		return "@" + escapeName(username)
+	}
+	return "друг"
+}
+
+func userLabel(u *model.User) string {
+	id := strconv.FormatInt(u.TelegramID, 10)
+	nick := ""
+	switch {
+	case u.Username != "":
+		nick = "@" + escapeName(u.Username)
+	case u.FirstName != "":
+		nick = escapeName(u.FirstName)
+	}
+	if nick == "" {
+		return id
+	}
+	return nick + " (" + id + ")"
+}
+
+func (a *App) userLabelByID(ctx context.Context, id int64) string {
+	if a.store != nil {
+		// Карточка читается ОДИН раз: подпись рисуется в списках пользователей
+		// построчно, и второе чтение на строку удваивало бы запросы к базе.
+		u, _ := a.store.GetUser(ctx, id)
+		// У аккаунта кабинета нет ни имени, ни @username — подписываем почтой.
+		// Проверяется не знак идентификатора, а наличие имени: после привязки
+		// Telegram аккаунт положительный, и подписывать его почтой вместо имени
+		// уже неправильно.
+		if u == nil || (u.Username == "" && u.FirstName == "") {
+			if wu, _ := a.store.GetWebUserByTgID(ctx, id); wu != nil && wu.Email != "" {
+				// Эскейп обязателен: e-mail — свободный ввод при регистрации в
+				// кабинете и попадает в сообщения с ParseModeHTML.
+				return "📧 " + escapeName(wu.Email)
+			}
+		}
+		if u != nil {
+			return userLabel(u)
+		}
+	}
+	return strconv.FormatInt(id, 10)
+}
+
+const subCacheTTL = 30
+
+func (a *App) userHasSub(ctx context.Context, chatID int64) bool {
+
+	a.subMu.Lock()
+	if a.subCache != nil {
+		if e, ok := a.subCache[chatID]; ok && time.Now().Before(e.expireAt) {
+			a.subMu.Unlock()
+			return e.has
+		}
+	}
+	a.subMu.Unlock()
+
+	a.mu.Lock()
+	panel := a.panel
+	a.mu.Unlock()
+	if panel == nil {
+		return false
+	}
+	_, _, _, has, err := panel.SubscriptionState(ctx, chatID)
+	if err != nil {
+		// Панель молчит — это НЕ «подписки нет». Отрицательный ответ при
+		// аварии кэшировался на полминуты и переживал возвращение панели:
+		// платящий клиент полминуты видел «у вас нет подписок, купите».
+		// Отдаём последнее известное значение и ничего не запоминаем.
+		a.subMu.Lock()
+		last := false
+		if a.subCache != nil {
+			if e, ok := a.subCache[chatID]; ok {
+				last = e.has
+			}
+		}
+		a.subMu.Unlock()
+		return last
+	}
+
+	a.subMu.Lock()
+	if a.subCache == nil {
+		a.subCache = map[int64]subCacheEntry{}
+	}
+	a.subCache[chatID] = subCacheEntry{has: has, expireAt: time.Now().Add(subCacheTTL * time.Second)}
+	a.subMu.Unlock()
+	return has
+}
+
+func (a *App) invalidateSubCache(chatID int64) {
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	if a.subCache != nil {
+		delete(a.subCache, chatID)
+	}
+}
+
+func (a *App) navRow(ctx context.Context, chatID int64) []models.InlineKeyboardButton {
+	lang := a.lang(chatID)
+	var row []models.InlineKeyboardButton
+	if a.userHasSub(ctx, chatID) {
+		row = append(row, btn(i18n.T(lang, "btn.mysubs"), "menu:mysubs"))
+		if a.renewEligible(ctx, chatID) {
+			row = append(row, btn(i18n.T(lang, "btn.renew"), "menu:renew"))
+		}
+	} else {
+		if a.trialAvailable(ctx, chatID) {
+			row = append(row, btn(i18n.T(lang, "btn.trial_user"), "menu:trial"))
+		}
+		row = append(row, btn(i18n.T(lang, "btn.buy"), "menu:buy"))
+	}
+	row = append(row, btn(i18n.T(lang, "btn.balance"), "menu:balance"))
+	return row
+}
+
+func (a *App) renewEligible(ctx context.Context, chatID int64) bool {
+	if a.store == nil {
+		return false
+	}
+	u, _ := a.store.GetUser(ctx, chatID)
+	if u == nil {
+		return false
+	}
+	if u.NotifyKind == "trial" {
+		return true
+	}
+	if u.SubExpireAt == "" {
+		return false
+	}
+	exp, err := time.Parse(time.RFC3339, u.SubExpireAt)
+	if err != nil {
+		return false
+	}
+	return daysUntil(exp, time.Now().UTC()) <= 7
+}
+
+func (a *App) contactRows() [][]models.InlineKeyboardButton {
+	a.mu.Lock()
+	g, sup := "", ""
+	if a.botCfg != nil {
+		g, sup = a.botCfg.Contact.GroupURL, a.botCfg.Contact.SupportURL
+	}
+	lang := i18n.Fallback
+	if a.botCfg != nil && a.botCfg.Language != "" {
+		lang = a.botCfg.Language
+	}
+	a.mu.Unlock()
+	// Второй рубеж: адрес из конфига мог попасть туда до проверки при вводе
+	// (старая установка) или из импорта. Битая кнопка отвергает всё сообщение
+	// целиком, поэтому лучше показать меню без неё, чем не показать вовсе.
+	var row []models.InlineKeyboardButton
+	if validButtonURL(g) {
+		row = append(row, models.InlineKeyboardButton{Text: i18n.T(lang, "btn.group"), URL: g})
+	}
+	if validButtonURL(sup) {
+		row = append(row, models.InlineKeyboardButton{Text: i18n.T(lang, "btn.support"), URL: sup})
+	}
+	if len(row) == 0 {
+		return nil
+	}
+	return [][]models.InlineKeyboardButton{row}
+}
+
+// sendPayKB renders a Sales sub-screen on the parent "Продажи" banner so that
+// navigation within the category edits the caption in place (no delete+resend).
+func (a *App) sendPayKB(ctx context.Context, chatID int64, text string, rows [][]models.InlineKeyboardButton) {
+	a.sendKBSection(ctx, chatID, assets.SectionBuySubscription, text, rows)
+}
+
+func (a *App) sendSysKB(ctx context.Context, chatID int64, text string, rows [][]models.InlineKeyboardButton) {
+	a.sendKBSection(ctx, chatID, assets.SectionAdminStats, text, rows)
+}
+
+func (a *App) sendIfaceKB(ctx context.Context, chatID int64, text string, rows [][]models.InlineKeyboardButton) {
+	a.sendKBSection(ctx, chatID, assets.SectionMainMenu, text, rows)
+}
+
+func (a *App) sendMktKB(ctx context.Context, chatID int64, text string, rows [][]models.InlineKeyboardButton) {
+	a.sendKBSection(ctx, chatID, assets.SectionPromoCode, text, rows)
+}
+
+// sendUsrKB renders an admin Users screen on the shared Users/referral banner
+// so navigation within the section edits the caption in place.
+func (a *App) sendUsrKB(ctx context.Context, chatID int64, text string, rows [][]models.InlineKeyboardButton) {
+	a.sendKBSection(ctx, chatID, assets.SectionReferral, text, rows)
+}
+
+func homeRow(lang string) []models.InlineKeyboardButton {
+	return []models.InlineKeyboardButton{btn(i18n.T(lang, "btn.home"), "menu:home")}
+}
+
+// toggleBtn renders an on/off button whose label reflects the current state,
+// so the admin sees the state without reading the title.
+func toggleBtn(lang string, on bool, cb string) models.InlineKeyboardButton {
+	key := "btn.toggle_off"
+	if on {
+		key = "btn.toggle_on"
+	}
+	return btn(i18n.T(lang, key), cb)
+}
+
+func navBack(lang, backCB string) []models.InlineKeyboardButton {
+	return []models.InlineKeyboardButton{
+		btn(i18n.T(lang, "btn.back"), backCB),
+		btn(i18n.T(lang, "btn.home"), "menu:home"),
+	}
+}
+
+// paginationRow builds a prev/next navigation row. prefix is the callback prefix
+// up to and including the trailing separator (e.g. "usr:page:"); the target page
+// index is appended. Returns nil when there is only a single page.
+func paginationRow(prefix string, page, pages int, prevLabel, nextLabel string) []models.InlineKeyboardButton {
+	var nav []models.InlineKeyboardButton
+	if page > 0 {
+		nav = append(nav, btn(prevLabel, prefix+strconv.Itoa(page-1)))
+	}
+	if page+1 < pages {
+		nav = append(nav, btn(nextLabel, prefix+strconv.Itoa(page+1)))
+	}
+	return nav
+}
+
+func (a *App) adminMenuRows(lang string) [][]models.InlineKeyboardButton {
+	return [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "menu.cat_pay"), "menu:pay"), btn(i18n.T(lang, "menu.cat_marketing"), "menu:marketing")},
+		{btn(i18n.T(lang, "menu.cat_iface"), "menu:iface"), btn(i18n.T(lang, "btn.users"), "menu:users")},
+		{btn(i18n.T(lang, "menu.cat_system"), "menu:system"), btn(i18n.T(lang, "btn.storefront"), "menu:buy")},
+	}
+}
+
+func (a *App) showIface(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.sendKBSection(ctx, chatID, assets.SectionMainMenu, i18n.T(lang, "menu.iface_title"), [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "btn.banner"), "menu:welcome"), btn(i18n.T(lang, "btn.emoji"), "menu:emoji")},
+		{btn(i18n.T(lang, "btn.section_banners"), "menu:welcome_sections")},
+		{btn(i18n.T(lang, "btn.contacts"), "menu:contacts")},
+		{btn(i18n.T(lang, "btn.devices_admin"), "menu:devices")},
+		{btn(i18n.T(lang, "btn.bot_lang")+": "+i18n.T(lang, "lang.name_"+lang), "menu:botlang")},
+		homeRow(lang),
+	})
+}
+
+// showBotLang — выбор языка бота.
+//
+// До этого язык задавался только на первом шаге первичного мастера, и сменить
+// его после установки было нельзя вообще ничем: переустановка стартует сразу с
+// выбора базы, а обработчик языка живёт только при активном мастере.
+func (a *App) showBotLang(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.sendKBSection(ctx, chatID, assets.SectionMainMenu, i18n.T(lang, "lang.title"), [][]models.InlineKeyboardButton{
+		{btn("🇷🇺 "+i18n.T(lang, "lang.name_ru"), "botlang:ru"), btn("🇬🇧 "+i18n.T(lang, "lang.name_en"), "botlang:en")},
+		{btn(i18n.T(lang, "btn.back"), "menu:iface"), btn(i18n.T(lang, "btn.home"), "menu:home")},
+	})
+}
+
+// setBotLang меняет язык бота и сразу перерисовывает экран уже на новом.
+func (a *App) setBotLang(ctx context.Context, chatID int64, code string) {
+	if code != "ru" && code != "en" {
+		return
+	}
+	a.mu.Lock()
+	if a.botCfg != nil {
+		a.botCfg.Language = code
+	}
+	a.mu.Unlock()
+	_ = a.saveBotConfig(ctx)
+	a.showBotLang(ctx, chatID)
+}
+
+func (a *App) showPay(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.mu.Lock()
+	p2pOn, starsOn, ykOn, cbOn, plOn, hlOn, trbOn := false, false, false, false, false, false, false
+	strat := "MONTH"
+	addsubOn, addsubGB, addsubInt := false, 0, 0
+	if a.botCfg != nil {
+		p2pOn = a.botCfg.P2P.Enabled
+		starsOn = a.botCfg.Stars.Enabled
+		ykOn = a.botCfg.YooKassa.Enabled
+		cbOn = a.botCfg.CryptoBot.Enabled
+		plOn = a.botCfg.Platega.Enabled
+		hlOn = a.botCfg.Heleket.Enabled
+		trbOn = a.botCfg.Tribute.Enabled
+		strat = a.botCfg.Pricing.ResetStrategy()
+		addsubOn = a.botCfg.AddSub.Enabled
+		addsubGB = a.botCfg.AddSub.TrafficGB
+		addsubInt = len(a.botCfg.AddSub.InternalSquads)
+	}
+	a.mu.Unlock()
+	mark := func(on bool) string {
+		if on {
+			return "✅"
+		}
+		return "❌"
+	}
+	internalCSV, externalName := a.squadDisplay(ctx)
+	title := i18n.T(lang, "subsetup.title",
+		mark(p2pOn), mark(starsOn), mark(ykOn), mark(cbOn), mark(plOn), mark(hlOn), mark(trbOn),
+		a.formatTrafficLimits(), a.formatDeviceLimits(lang), strat,
+		internalCSV, externalName,
+	)
+	if addsubOn {
+		traffic := i18n.T(lang, "addsub.unlimited")
+		if addsubGB > 0 {
+			traffic = strconv.Itoa(addsubGB) + " GB"
+		}
+		title += i18n.T(lang, "subsetup.addsub_block", traffic, addsubInt)
+	}
+	a.sendKBSection(ctx, chatID, assets.SectionBuySubscription, title, [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "subsetup.btn_quick"), "prc:quick"), btn(i18n.T(lang, "subsetup.btn_manual"), "menu:pricing")},
+		{btn(i18n.T(lang, "btn.plans"), "menu:plans")},
+		{btn(i18n.T(lang, "btn.trial_admin"), "menu:trial"), btn(i18n.T(lang, "btn.squads"), "menu:squads")},
+		{btn(i18n.T(lang, "btn.addsub"), "menu:addsub")},
+		{btn(i18n.T(lang, "btn.p2p"), "menu:p2p"), btn(i18n.T(lang, "btn.stars"), "menu:stars")},
+		{btn(i18n.T(lang, "btn.yookassa"), "menu:yookassa"), btn(i18n.T(lang, "btn.cryptobot"), "menu:cryptobot")},
+		{btn(i18n.T(lang, "btn.platega"), "menu:platega"), btn(i18n.T(lang, "btn.heleket"), "menu:heleket")},
+		{btn(i18n.T(lang, "btn.tribute"), "menu:tribute")},
+		{btn(i18n.T(lang, "btn.wallet"), "menu:wallet")},
+		{btn(i18n.T(lang, "btn.payments"), "menu:payments"), btn(i18n.T(lang, "btn.analytics"), "menu:analytics")},
+		{btn(i18n.T(lang, "btn.moynalog"), "menu:moynalog")},
+		homeRow(lang),
+	})
+}
+
+func (a *App) showMarketing(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.sendKBSection(ctx, chatID, assets.SectionPromoCode, i18n.T(lang, "menu.marketing_title"), [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "btn.promo_admin"), "menu:promoadmin"), btn(i18n.T(lang, "btn.referral_admin"), "menu:refadmin")},
+		{btn(i18n.T(lang, "btn.broadcast"), "menu:broadcast"), btn(i18n.T(lang, "btn.notify"), "menu:notify")},
+		homeRow(lang),
+	})
+}
+
+func (a *App) showSystem(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.mu.Lock()
+	updOn := a.botCfg != nil && a.botCfg.UpdateCheck.Enabled
+	a.mu.Unlock()
+	updLabel := i18n.T(lang, "btn.upd_notify_off")
+	if updOn {
+		updLabel = i18n.T(lang, "btn.upd_notify_on")
+	}
+	rows := [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "btn.update"), "menu:update"), btn(i18n.T(lang, "btn.check_update"), "upd:check")},
+		{btn(updLabel, "upd:toggle"), btn(i18n.T(lang, "btn.channel")+": "+a.channelName(lang), "upd:chan")},
+		{btn(i18n.T(lang, "btn.status"), "menu:status"), btn(i18n.T(lang, "btn.apilog"), "menu:apilog")},
+		{btn(i18n.T(lang, "btn.webhooks"), "menu:webhooks"), btn(i18n.T(lang, "btn.subdomain"), "menu:subdomain")},
+		{btn(i18n.T(lang, "btn.miniapp"), "menu:miniapp"), btn(i18n.T(lang, "btn.cabinet"), "menu:cabinet")},
+		{btn(i18n.T(lang, "btn.mail"), "menu:mail")},
+		{btn(i18n.T(lang, "btn.rsimport"), "menu:rsimp")},
+		{btn(i18n.T(lang, "csqtt.btn_adm"), "menu:csqttadm")},
+	}
+	// Ключ/кука доступа к панели — только там, где панель вообще чем-то закрыта.
+	if a.panelAuthRelevant() {
+		rows = append(rows, []models.InlineKeyboardButton{
+			btn(i18n.T(lang, "btn.panelauth"), "menu:panelauth"),
+		})
+	}
+	rows = append(rows,
+		[]models.InlineKeyboardButton{btn(i18n.T(lang, "btn.reconfig"), "menu:reconf")},
+		homeRow(lang))
+	a.sendKBSection(ctx, chatID, assets.SectionAdminStats, i18n.T(lang, "menu.system_title"), rows)
+}
+
+func (a *App) squadDisplay(ctx context.Context) (string, string) {
+	a.mu.Lock()
+	var activeInt []string
+	extUUID := ""
+	if a.botCfg != nil {
+		activeInt = append([]string(nil), a.botCfg.Plan.ActiveInternalSquads...)
+		extUUID = a.botCfg.Plan.ExternalSquadUUID
+	}
+	a.mu.Unlock()
+	return a.squadNames(ctx, activeInt, extUUID)
+}
+
+func (a *App) squadNames(ctx context.Context, activeInt []string, extUUID string) (string, string) {
+	a.mu.Lock()
+	panel := a.panel
+	lang := i18n.Fallback
+	if a.botCfg != nil && a.botCfg.Language != "" {
+		lang = a.botCfg.Language
+	}
+	a.mu.Unlock()
+
+	names := map[string]string{}
+	if panel != nil {
+		if ints, err := panel.ListSquads(ctx); err == nil {
+			for _, s := range ints {
+				names[s.UUID] = s.Name
+			}
+		}
+		if exts, err := panel.ListExternalSquads(ctx); err == nil {
+			for _, s := range exts {
+				names[s.UUID] = s.Name
+			}
+		}
+	}
+	disp := func(uuid string) string {
+		if n, ok := names[uuid]; ok && n != "" {
+			return n
+		}
+		return uuid
+	}
+	var ints []string
+	for _, u := range activeInt {
+		ints = append(ints, disp(u))
+	}
+	internalCSV := strings.Join(ints, ", ")
+	if internalCSV == "" {
+		internalCSV = i18n.T(lang, "admin.none")
+	}
+	externalName := i18n.T(lang, "admin.none")
+	if extUUID != "" {
+		externalName = disp(extUUID)
+	}
+	return internalCSV, externalName
+}
+
+func (a *App) startReconfigure(ctx context.Context, chatID int64) {
+	a.mu.Lock()
+	var base model.BotConfig
+	// Именно копия: обычное присваивание оставляет карты и слайсы общими с живым
+	// конфигом, и мастер переустановки правил бы работающего бота ещё до
+	// сохранения — да ещё и без замка. Ошибку копии глотать нельзя молча, но и
+	// падать здесь незачем: пустой конфиг мастер просто спросит заново.
+	if cp, err := a.botCfg.Clone(); err != nil {
+		a.log.Warn("копия конфига для мастера переустановки не снята", "err", err)
+	} else if cp != nil {
+		base = *cp
+	}
+	w := &wizard{step: stepDB, cfg: base, reconfig: true}
+	a.wiz[chatID] = w
+	a.mu.Unlock()
+	// Незавершённое ожидание ввода из другого раздела снимаем: админ ушёл
+	// сюда, значит тот ввод брошен. Иначе первый же текст в мастере будет
+	// принят за ответ тому разделу — мастер погаснет на середине, а текст
+	// уедет не туда.
+	a.getUI(chatID).adminInput = ""
+	a.gotoDB(ctx, chatID, w)
+}
+
+// cancelReconfigure aborts an in-progress reconfigure wizard and returns to the
+// System menu (rendered in place on the same banner).
+func (a *App) cancelReconfigure(ctx context.Context, chatID int64) {
+	a.mu.Lock()
+	delete(a.wiz, chatID)
+	a.mu.Unlock()
+	a.showSystem(ctx, chatID)
+}
+
+func bannerInputFor(section string) models.InputFile {
+	if b := assets.Bytes(section); len(b) > 0 {
+		return &models.InputFileUpload{Filename: section + ".jpg", Data: bytes.NewReader(b)}
+	}
+	return &models.InputFileUpload{Filename: "welcome.jpg", Data: bytes.NewReader(defaultBanner)}
+}
+
+func (a *App) welcomeContent(name string) (models.InputFile, string, []models.MessageEntity) {
+	a.mu.Lock()
+	var w model.WelcomeConfig
+	lang := i18n.Fallback
+	if a.botCfg != nil {
+		w = a.botCfg.Welcome
+		if a.botCfg.Language != "" {
+			lang = a.botCfg.Language
+		}
+	}
+	a.mu.Unlock()
+
+	var photo models.InputFile
+	switch {
+	case w.ImageFileID != "":
+		photo = &models.InputFileString{Data: w.ImageFileID}
+	case w.ImageURL != "":
+		photo = &models.InputFileString{Data: w.ImageURL}
+	default:
+		photo = &models.InputFileUpload{Filename: "welcome.jpg", Data: bytes.NewReader(defaultBanner)}
+	}
+
+	caption := w.Text
+	var ents []models.MessageEntity
+	if caption == "" {
+		caption = i18n.T(lang, "menu.welcome", name)
+	} else if len(w.Entities) > 0 {
+		_ = json.Unmarshal(w.Entities, &ents)
+	}
+	return photo, caption, ents
+}
+
+func (a *App) showMenu(ctx context.Context, chatID int64, isAdmin bool, name string) {
+	a.ensureHomeKey(ctx, chatID)
+	// Гейт согласия на входе стоит здесь, а не только в enterHome: в меню
+	// ведёт и кнопка «🏠 На главную» с любого экрана, включая сами документы.
+	if !isAdmin && a.legalStartRequired(ctx, chatID) {
+		a.getUI(chatID).pendingLegalHome = true
+		a.askLegal(ctx, chatID)
+		return
+	}
+	lang := a.botLang()
+	photo, caption, ents := a.welcomeContent(name)
+	var rows [][]models.InlineKeyboardButton
+	if isAdmin {
+		caption = i18n.T(lang, "menu.admin_title")
+		ents = nil
+		rows = a.adminMenuRows(lang)
+		photo = bannerInputFor(assets.SectionAdminStats)
+	} else {
+		rows = append(rows, a.navRow(ctx, chatID))
+		if a.csqttEnabled() {
+			rows = append(rows, []models.InlineKeyboardButton{btn(i18n.T(lang, "csqtt.btn_menu"), "menu:csqtt")})
+		}
+		if row := a.miniAppButtonRow(lang); row != nil {
+			rows = append(rows, row)
+		}
+		if a.referralCfg().Enabled {
+			rows = append(rows, []models.InlineKeyboardButton{btn(i18n.T(lang, "btn.referral"), "menu:ref")})
+		}
+		if row := a.legalMenuRow(lang); row != nil {
+			rows = append(rows, row)
+		}
+		rows = append(rows, a.contactRows()...)
+	}
+	if len(ents) == 0 {
+		caption = a.applyPremium(caption)
+	}
+	a.sendBanner(ctx, chatID, photo, caption, ents, models.InlineKeyboardMarkup{InlineKeyboard: rows})
+}
+
+func (a *App) registerUser(ctx context.Context, chatID int64, firstName, username string) {
+	if a.store != nil {
+		_ = a.store.UpsertUser(ctx, chatID)
+		_ = a.store.SetUserInfo(ctx, chatID, username, firstName)
+		a.reconcileWhitelist(ctx, chatID)
+	}
+	if a.guardNewUser(ctx, chatID, firstName, username) {
+		return
+	}
+	if a.syncPanelAccount(ctx, chatID) {
+		if u, _ := a.store.GetUser(ctx, chatID); u != nil && u.SubExpireAt != "" {
+			lang := a.lang(chatID)
+			a.notify(ctx, chatID, i18n.T(lang, "sync.linked", formatExpire(u.SubExpireAt, lang)))
+		}
+	}
+	// Согласие при первом входе: новичок — как раз тот, кому документы и
+	// показывают, поэтому гейт стоит и здесь, а не только в enterHome.
+	if a.legalStartRequired(ctx, chatID) {
+		a.getUI(chatID).pendingLegalHome = true
+		a.askLegal(ctx, chatID)
+		return
+	}
+	a.showMenu(ctx, chatID, false, displayName(firstName, username))
+}
+
+func (a *App) onMenu(ctx context.Context, chatID int64, val string, isAdmin bool, firstName, username string) {
+	name := displayName(firstName, username)
+	// Уход в меню отменяет ожидание секрета доступа к панели: см. clearPanelInput.
+	a.clearPanelInput(chatID)
+	switch val {
+	case "buy":
+		a.showPlans(ctx, chatID)
+	case "renew":
+		// Продление ведёт на СВОЙ тариф: подписчику тарифа по ссылке витрина
+		// «Базового» продала бы чужие условия (или отказала бы вовсе).
+		a.showRenew(ctx, chatID)
+	case "topup":
+		if a.legalGateOrAsk(ctx, chatID) {
+			return
+		}
+		a.showTopUp(ctx, chatID)
+	case "wallet":
+		if isAdmin {
+			a.showWalletAdmin(ctx, chatID)
+		}
+	case "balance":
+		a.showBalance(ctx, chatID)
+	case "ref":
+		a.showReferral(ctx, chatID)
+	case "refadmin":
+		if isAdmin {
+			a.showReferralAdmin(ctx, chatID)
+		}
+	case "broadcast":
+		if isAdmin {
+			a.showBroadcast(ctx, chatID)
+		}
+	case "promo":
+		if a.legalGateOrAsk(ctx, chatID) {
+			return
+		}
+		a.showPromoUser(ctx, chatID)
+	case "promoadmin":
+		if isAdmin {
+			a.showPromoAdmin(ctx, chatID)
+		}
+	case "moynalog":
+		if isAdmin {
+			a.showMoyNalogAdmin(ctx, chatID)
+		}
+	case "platega":
+		if isAdmin {
+			a.showPlategaAdmin(ctx, chatID)
+		}
+	case "heleket":
+		if isAdmin {
+			a.showHeleketAdmin(ctx, chatID)
+		}
+	case "tribute":
+		if isAdmin {
+			a.showTributeAdmin(ctx, chatID)
+		}
+	case "analytics":
+		if isAdmin {
+			a.showAnalytics(ctx, chatID)
+		}
+	case "mysubs":
+		a.showMySubs(ctx, chatID)
+	case "csqtt":
+		a.showCsqttUser(ctx, chatID)
+	case "csqttadm":
+		if isAdmin {
+			a.showCsqttAdmin(ctx, chatID)
+		}
+	case "autopay":
+		a.showAutoPay(ctx, chatID)
+	case "access":
+		if isAdmin {
+			a.showAccess(ctx, chatID)
+		}
+	case "home":
+		a.showMenu(ctx, chatID, isAdmin, name)
+	case "register":
+		a.registerUser(ctx, chatID, firstName, username)
+	case "status":
+		if isAdmin {
+			a.handleStatus(ctx, chatID)
+		}
+	case "p2p":
+		if isAdmin {
+			a.showP2PAdmin(ctx, chatID)
+		}
+	case "emoji":
+		if isAdmin {
+			a.showEmojiGrid(ctx, chatID)
+		}
+	case "welcome":
+		if isAdmin {
+			a.showWelcomeAdmin(ctx, chatID)
+		}
+	case "welcome_sections":
+		if isAdmin {
+			a.showSectionBanners(ctx, chatID)
+		}
+	case "subdomain":
+		if isAdmin {
+			a.showSubdomain(ctx, chatID)
+		}
+	case "panelauth":
+		if isAdmin {
+			a.showPanelAuth(ctx, chatID, "")
+		}
+	case "apilog":
+		if isAdmin {
+			a.showAPILog(ctx, chatID, 0)
+		}
+	case "webhooks":
+		if isAdmin {
+			a.showWebhooksAdmin(ctx, chatID)
+		}
+	case "notify":
+		if isAdmin {
+			a.showNotifyAdmin(ctx, chatID)
+		}
+	case "cryptobot":
+		if isAdmin {
+			a.showCryptoBotAdmin(ctx, chatID)
+		}
+	case "squads":
+		if isAdmin {
+			a.showSquads(ctx, chatID)
+		}
+	case "trial":
+		if isAdmin {
+			a.showTrialAdmin(ctx, chatID)
+		} else {
+			if a.legalGateOrAsk(ctx, chatID) {
+				return
+			}
+			a.activateTrial(ctx, chatID)
+		}
+	case "contacts":
+		if isAdmin {
+			a.showContacts(ctx, chatID)
+		}
+	case "update":
+		if isAdmin {
+			a.handleUpdate(ctx, chatID)
+		}
+	case "iface":
+		if isAdmin {
+			a.showIface(ctx, chatID)
+		}
+	case "botlang":
+		if isAdmin {
+			a.showBotLang(ctx, chatID)
+		}
+	case "pay":
+		if isAdmin {
+			a.showPay(ctx, chatID)
+		}
+	case "manage":
+		if isAdmin {
+			a.showMenu(ctx, chatID, true, name)
+		}
+	case "addsub":
+		if isAdmin {
+			a.showAddSubAdmin(ctx, chatID)
+		}
+	case "marketing":
+		if isAdmin {
+			a.showMarketing(ctx, chatID)
+		}
+	case "system":
+		if isAdmin {
+			a.showSystem(ctx, chatID)
+		}
+	case "devices":
+		if isAdmin {
+			a.showDevicesAdmin(ctx, chatID)
+		}
+	case "miniapp":
+		if isAdmin {
+			a.showMiniAppAdmin(ctx, chatID)
+		}
+	case "miniapptoggle":
+		if isAdmin {
+			a.toggleMiniApp(ctx, chatID)
+		}
+	case "cabinet":
+		if isAdmin {
+			a.showCabinetAdmin(ctx, chatID)
+		}
+	case "rsimp":
+		if isAdmin {
+			a.showRSImport(ctx, chatID)
+		}
+	case "cabtoggle":
+		if isAdmin {
+			a.toggleCabinet(ctx, chatID)
+		}
+	case "cabpath":
+		if isAdmin {
+			a.getUI(chatID).adminInput = "cab_path"
+			a.askInput(ctx, chatID, i18n.T(a.lang(chatID), "cabinet.ask_path"), "menu:cabinet")
+		}
+	case "cabapprove":
+		if isAdmin {
+			a.cycleCabinetApproval(ctx, chatID)
+		}
+	case "cabtitle":
+		if isAdmin {
+			a.getUI(chatID).adminInput = "cab_title"
+			a.askInput(ctx, chatID, i18n.T(a.lang(chatID), "cabinet.ask_title"), "menu:cabinet")
+		}
+	case "cabdesc":
+		if isAdmin {
+			a.getUI(chatID).adminInput = "cab_desc"
+			a.askInput(ctx, chatID, i18n.T(a.lang(chatID), "cabinet.ask_desc"), "menu:cabinet")
+		}
+	case "cabfav":
+		if isAdmin {
+			a.getUI(chatID).adminInput = "cab_favicon"
+			a.askInput(ctx, chatID, i18n.T(a.lang(chatID), "cabinet.ask_favicon"), "menu:cabinet")
+		}
+	case "cabfp":
+		if isAdmin {
+			a.toggleCabinetAntiFP(ctx, chatID)
+		}
+	case "cablogout":
+		if isAdmin {
+			a.logoutAllSessions(ctx, chatID)
+		}
+	case "mail":
+		if isAdmin {
+			a.showMailAdmin(ctx, chatID)
+		}
+	case "mailtoggle":
+		if isAdmin {
+			a.toggleMail(ctx, chatID)
+		}
+	case "mailmode":
+		if isAdmin {
+			a.cycleMailMode(ctx, chatID)
+		}
+	case "mailtls":
+		if isAdmin {
+			a.cycleMailTLS(ctx, chatID)
+		}
+	case "mailtest":
+		if isAdmin {
+			a.sendTestMail(ctx, chatID)
+		}
+	case "mailfrom", "mailfromname", "mailhost", "mailuser", "mailpass", "mailapiurl", "mailapikey":
+		if isAdmin {
+			a.getUI(chatID).adminInput = "mail_" + strings.TrimPrefix(val, "mail")
+			a.askInput(ctx, chatID, i18n.T(a.lang(chatID), "mail.ask_"+strings.TrimPrefix(val, "mail")), "menu:mail")
+		}
+	case "reconf":
+		if isAdmin {
+			a.startReconfigure(ctx, chatID)
+		}
+	case "users":
+		if isAdmin {
+			a.showUsers(ctx, chatID, 0)
+		}
+	case "stars":
+		if isAdmin {
+			a.showStarsAdmin(ctx, chatID)
+		}
+	case "yookassa":
+		if isAdmin {
+			a.showYooKassaAdmin(ctx, chatID)
+		}
+	case "plans":
+		if isAdmin {
+			a.showPlansAdmin(ctx, chatID, 0)
+		}
+	case "pricing":
+		if isAdmin {
+			// Старый экран цен убран: кнопки из старых переписок ведут в
+			// редактор цен «Базового» — то же содержимое, один источник истины.
+			a.showPlanPricing(ctx, chatID, model.PlanCodeBase)
+		}
+	case "payments":
+		if isAdmin {
+			a.showPayments(ctx, chatID, 0)
+		}
+	}
+}
+
+func (a *App) showWelcomeAdmin(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	a.sendIfaceKB(ctx, chatID, i18n.T(lang, "welcome.title"), [][]models.InlineKeyboardButton{
+		{btn(i18n.T(lang, "welcome.btn_image"), "wel:img"), btn(i18n.T(lang, "welcome.btn_text"), "wel:txt")},
+		{btn(i18n.T(lang, "btn.back"), "menu:iface"), btn(i18n.T(lang, "btn.home"), "menu:home")},
+	})
+}
+
+func (a *App) onWelcome(ctx context.Context, chatID int64, val string) {
+	lang := a.lang(chatID)
+	ui := a.getUI(chatID)
+	cancel := [][]models.InlineKeyboardButton{{btn(i18n.T(lang, "btn.cancel"), "wel:cancel")}}
+	switch val {
+	case "img":
+		ui.welcomeAwait = "img"
+		a.sendKB(ctx, chatID, i18n.T(lang, "welcome.ask_image"), cancel)
+	case "txt":
+		ui.welcomeAwait = "txt"
+		a.sendKB(ctx, chatID, i18n.T(lang, "welcome.ask_text"), cancel)
+	case "cancel":
+		ui.welcomeAwait = ""
+		a.showWelcomeAdmin(ctx, chatID)
+	}
+}
+
+// setWelcomeImageURL сохраняет ссылку на баннер главной.
+//
+// Текст, который не является ссылкой, Telegram трактует как file_id и
+// отвечает «wrong remote file identifier» — баннер не уходит, а вместе с ним
+// не уходит и главное меню: со стороны это выглядит как «бот не запустился».
+// Поэтому мусор сюда не пропускаем, а пустое значение сбрасывает картинку к
+// встроенной.
+func (a *App) setWelcomeImageURL(ctx context.Context, chatID int64, url string) {
+	lang := a.lang(chatID)
+	raw := strings.TrimSpace(url)
+	if raw != "" && raw != "-" && raw != "—" {
+		norm, ok := normalizeDocURL(raw)
+		if !ok {
+			// Ввод не сбрасываем: человек дошлёт правильную ссылку или фото.
+			a.sendKB(ctx, chatID, i18n.T(lang, "welcome.bad_image"), [][]models.InlineKeyboardButton{
+				{btn(i18n.T(lang, "btn.cancel"), "wel:cancel")},
+			})
+			return
+		}
+		raw = norm
+	} else {
+		raw = ""
+	}
+	a.getUI(chatID).welcomeAwait = ""
+	a.mu.Lock()
+	if a.botCfg != nil {
+		a.botCfg.Welcome.ImageURL = raw
+		a.botCfg.Welcome.ImageFileID = ""
+	}
+	a.mu.Unlock()
+	_ = a.saveBotConfig(ctx)
+	a.showWelcomeAdmin(ctx, chatID)
+}
+
+func (a *App) setWelcomeImageFile(ctx context.Context, chatID int64, fileID string) {
+	a.getUI(chatID).welcomeAwait = ""
+	a.mu.Lock()
+	if a.botCfg != nil {
+		a.botCfg.Welcome.ImageFileID = fileID
+		a.botCfg.Welcome.ImageURL = ""
+	}
+	a.mu.Unlock()
+	_ = a.saveBotConfig(ctx)
+	a.showWelcomeAdmin(ctx, chatID)
+}
+
+func (a *App) setWelcomeText(ctx context.Context, chatID int64, m *models.Message) {
+	a.getUI(chatID).welcomeAwait = ""
+	ents, _ := json.Marshal(m.Entities)
+	a.mu.Lock()
+	if a.botCfg != nil {
+		a.botCfg.Welcome.Text = m.Text
+		a.botCfg.Welcome.Entities = ents
+	}
+	a.mu.Unlock()
+	_ = a.saveBotConfig(ctx)
+	a.showWelcomeAdmin(ctx, chatID)
+}
+
+func (a *App) showEmojiGrid(ctx context.Context, chatID int64) {
+	lang := a.lang(chatID)
+	m := a.premiumMap()
+	var sb strings.Builder
+	sb.WriteString(i18n.T(lang, "emoji.title"))
+	sb.WriteString("\n")
+	for _, e := range botEmojis {
+		mark := ""
+		if _, ok := m[e.E]; ok {
+			mark = " ✅"
+		}
+		sb.WriteString("\n" + e.E + mark + " — " + e.Use)
+	}
+
+	var rows [][]models.InlineKeyboardButton
+	var row []models.InlineKeyboardButton
+	for _, e := range botEmojis {
+		label := e.E
+		if _, ok := m[e.E]; ok {
+			label = e.E + "✅"
+		}
+		row = append(row, btn(label, "emo:set:"+e.E))
+		if len(row) == 4 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+	rows = append(rows, []models.InlineKeyboardButton{btn(i18n.T(lang, "btn.back"), "menu:iface"), btn(i18n.T(lang, "btn.home"), "menu:home")})
+	a.sendIfaceKB(ctx, chatID, sb.String(), rows)
+}
+
+func (a *App) onEmoji(ctx context.Context, chatID int64, val string) {
+	lang := a.lang(chatID)
+	action, arg, _ := strings.Cut(val, ":")
+	switch action {
+	case "set":
+		a.getUI(chatID).awaitEmojiFor = arg
+		a.sendKB(ctx, chatID, i18n.T(lang, "emoji.ask_one", arg),
+			[][]models.InlineKeyboardButton{{btn(i18n.T(lang, "btn.cancel"), "emo:done")}})
+	case "done":
+		a.getUI(chatID).awaitEmojiFor = ""
+		a.showEmojiGrid(ctx, chatID)
+	}
+}
+
+func (a *App) setEmojiFor(ctx context.Context, chatID int64, m *models.Message) {
+	ui := a.getUI(chatID)
+	target := ui.awaitEmojiFor
+	ui.awaitEmojiFor = ""
+	var id string
+	for _, e := range m.Entities {
+		if e.Type == models.MessageEntityTypeCustomEmoji && e.CustomEmojiID != "" {
+			id = e.CustomEmojiID
+			break
+		}
+	}
+	if id == "" {
+		a.showEmojiGrid(ctx, chatID)
+		return
+	}
+	a.mu.Lock()
+	if a.botCfg != nil {
+		if a.botCfg.PremiumEmoji == nil {
+			a.botCfg.PremiumEmoji = map[string]string{}
+		}
+		a.botCfg.PremiumEmoji[target] = id
+	}
+	a.mu.Unlock()
+	_ = a.saveBotConfig(ctx)
+	a.showEmojiGrid(ctx, chatID)
+}

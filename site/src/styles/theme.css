@@ -1,0 +1,175 @@
+/* Палитра сайта chill-remna-bot — та же, что была на старой странице:
+   тёмный сине-серый фон, синий акцент, зелёный «stable», сиреневый «dev». */
+:root {
+  --brand-bg: #0a0d15;
+  --brand-bg2: #121726;
+  --brand-card: #151a2a;
+  --brand-line: #232c42;
+  --brand-fg: #e8edf7;
+  --brand-muted: #97a3bb;
+  --brand-accent: #5b8cff;
+  --brand-accent2: #27d3a2;
+  --brand-dev: #b58bff;
+  --brand-warn: #ffb454;
+}
+
+/* Тёмная тема — палитра прежнего сайта. Светлую оставляем штатной Starlight,
+   иначе подсветка кода (Expressive Code) остаётся светлой на тёмном фоне. */
+[data-theme='dark'] {
+  --sl-color-accent-low: #16224a;
+  --sl-color-accent: #3f6fe0;
+  --sl-color-accent-high: #b9ccff;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #e8edf7;
+  --sl-color-gray-2: #c3cbdd;
+  --sl-color-gray-3: #97a3bb;
+  --sl-color-gray-4: #5b6780;
+  --sl-color-gray-5: #2a3452;
+  --sl-color-gray-6: #192035;
+  --sl-color-black: #0a0d15;
+  --sl-color-bg: #0a0d15;
+  --sl-color-bg-nav: rgba(10, 13, 21, 0.85);
+  --sl-color-bg-sidebar: #0c1019;
+  --sl-color-hairline: #232c42;
+  --sl-color-hairline-light: #2a3452;
+  --sl-color-text-accent: #8fb0ff;
+}
+
+[data-theme='light'] {
+  --sl-color-accent-low: #d8e2ff;
+  --sl-color-accent: #2f5fd0;
+  --sl-color-accent-high: #16306e;
+  --sl-color-text-accent: #2f5fd0;
+}
+
+/* Фоновое свечение, как на прежней главной. */
+[data-theme='dark'] body {
+  background-image:
+    radial-gradient(1100px 520px at 78% -8%, rgba(91, 140, 255, 0.1), transparent),
+    radial-gradient(900px 480px at 8% 4%, rgba(39, 211, 162, 0.07), transparent);
+  background-attachment: fixed;
+}
+
+/* Заголовок страницы — тот же градиентный текст, что был в шапке сайта. */
+[data-theme='dark'] .content-panel h1#_top {
+  background: linear-gradient(180deg, #fff, #b9c6e6);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  letter-spacing: -0.02em;
+}
+
+/* Таблицы: компактнее и с полосами — их в доке много. */
+.sl-markdown-content table {
+  font-size: 0.94em;
+}
+.sl-markdown-content tbody tr:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.02);
+}
+.sl-markdown-content th {
+  color: var(--sl-color-white);
+  white-space: nowrap;
+}
+
+/* Значки каналов релиза (stable / dev) — как на прежней главной. */
+.tag {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.6;
+  padding: 1px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--brand-line);
+  vertical-align: middle;
+}
+.tag.stable {
+  color: var(--brand-accent2);
+  background: rgba(39, 211, 162, 0.1);
+}
+.tag.dev {
+  color: var(--brand-dev);
+  background: rgba(181, 139, 255, 0.12);
+}
+
+/* Главная: чипы под заголовком и аккуратные карточки. */
+.hero-chips {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.hero-chips span {
+  font-size: 13px;
+  /* цвета от темы Starlight, иначе в светлой теме чипы остаются тёмными */
+  color: var(--sl-color-gray-2);
+  background: var(--sl-color-gray-6);
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 10px;
+  padding: 7px 13px;
+}
+.hero-chips b {
+  color: var(--sl-color-white);
+}
+
+/* ── Пропорции колонок ───────────────────────────────────────────────────────
+   У Starlight обе боковые колонки по 18.75rem, а текст жёстко ограничен 45rem.
+   На ноутбучных 1150–1400px текст из-за этого сжимается до ~630px, а на 2K+
+   между меню и текстом остаётся пустая полоса, зато «На этой странице»
+   растягивается на четверть экрана. Пересчитываем: оглавление — узкая колонка
+   по своему содержимому, текст занимает остальное место и растёт вместе с
+   экраном. */
+/* Планшеты и небольшие ноутбуки: меню 18.75rem съедало место у текста. */
+@media (min-width: 50rem) {
+  :root {
+    --sl-sidebar-width: 16rem;
+  }
+}
+
+@media (min-width: 72rem) {
+  :root {
+    --sl-sidebar-width: 14.5rem;
+    --toc-width: 13.5rem;
+    /* шапка выравнивает поиск по той же сетке */
+    --__toc-width: var(--toc-width);
+    --sl-content-width: 45rem;
+  }
+  .right-sidebar-container {
+    width: var(--toc-width);
+  }
+  .right-sidebar {
+    width: var(--toc-width);
+  }
+  .right-sidebar-panel .sl-container {
+    width: 100%;
+    max-width: none;
+  }
+  [data-has-sidebar][data-has-toc] .main-pane {
+    width: calc(100% - var(--toc-width));
+    --sl-content-margin-inline: auto;
+  }
+}
+
+@media (min-width: 80rem) {
+  :root {
+    --sl-sidebar-width: 15.5rem;
+    --toc-width: 14.5rem;
+    --sl-content-width: 48rem;
+  }
+}
+
+@media (min-width: 90rem) {
+  :root {
+    --sl-sidebar-width: 17rem;
+    --toc-width: 15.5rem;
+    --sl-content-width: 52rem;
+  }
+}
+
+@media (min-width: 120rem) {
+  :root {
+    font-size: 17px;
+    --sl-sidebar-width: 18rem;
+    --toc-width: 17rem;
+    --sl-content-width: 60rem;
+  }
+}

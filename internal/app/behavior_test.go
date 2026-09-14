@@ -1,0 +1,2754 @@
+package app
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
+
+	"remnabot/internal/config"
+	"remnabot/internal/i18n"
+	"remnabot/internal/model"
+	"remnabot/internal/remnawave"
+	"remnabot/internal/storage"
+	"remnabot/internal/yookassa"
+)
+
+type fakeMsg struct {
+	mu       sync.Mutex
+	texts    []string
+	seq      int
+	live     map[int]string
+	deleted  []int
+	invoices []string
+	// downloads подменяет скачивание файлов из Telegram: ключ — file_id.
+	downloads map[string][]byte
+	// docs — документы, отправленные ботом: ключ — имя файла.
+	docs map[string][]byte
+	// refunds — возвраты звёзд, которые бот попросил у Telegram ("<uid>:<charge>").
+	refunds   []string
+	refundErr error
+	// kbFail — SendKB возвращает 0 (Telegram отказал): так проверяется, что
+	// вызывающий отличает доставку от неудачи.
+	kbFail bool
+	// forbidden — чаты, где Telegram отвечает 403 («человек заблокировал
+	// бота»): так проверяется, что рассылка отличает это от временной ошибки.
+	forbidden map[int64]bool
+	// sendDelay — искусственная задержка отправки: так проверяется поведение
+	// при одновременных доставках.
+	sendDelay time.Duration
+	// starTx — история звёздных операций, которую отдаёт GetStarTransactions.
+	starTx []models.StarTransaction
+	// sentDocIDs — file_id (или имя файла при загрузке) документов, ушедших
+	// через SendDocumentKB: так проверяется пересылка чека-файла админу.
+	sentDocIDs []string
+	// preOK — ответы предпроверок Stars по порядку.
+	preOK []bool
+	// cbData — callback_data всех кнопок, ушедших с сообщениями.
+	cbData []string
+	// failBanner — картинка (file_id/ссылка), на которой SendBanner отвечает
+	// отказом; failAllBanners — отказ на любой картинке.
+	failBanner     string
+	failBannerErr  string
+	failAllBanners bool
+	// btnText — подписи тех же кнопок. Подписи Telegram принимает обычным
+	// текстом, поэтому экранирование в них — ошибка, и проверять их надо
+	// отдельно от текста сообщения.
+	btnText []string
+}
+
+// allCallbackData возвращает callback_data всех отправленных кнопок.
+func (f *fakeMsg) allCallbackData() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.cbData))
+	copy(out, f.cbData)
+	return out
+}
+
+func (f *fakeMsg) recordKB(rows [][]models.InlineKeyboardButton) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, row := range rows {
+		for _, b := range row {
+			if b.CallbackData != "" {
+				f.cbData = append(f.cbData, b.CallbackData)
+			}
+			if b.Text != "" {
+				f.btnText = append(f.btnText, b.Text)
+			}
+		}
+	}
+}
+
+// buttonLabels возвращает подписи всех отправленных кнопок.
+func (f *fakeMsg) buttonLabels() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.btnText))
+	copy(out, f.btnText)
+	return out
+}
+
+func hasCB(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeMsg) Send(_ context.Context, _ int64, text string) int { return f.add(text) }
+func (f *fakeMsg) SendErr(_ context.Context, chatID int64, text string) (int, error) {
+	if f.forbidden != nil && f.forbidden[chatID] {
+		return 0, bot.ErrorForbidden
+	}
+	id := f.add(text)
+	if f.kbFail {
+		return 0, errors.New("не доставлено")
+	}
+	return id, nil
+}
+func (f *fakeMsg) SendKB(_ context.Context, _ int64, text string, rows [][]models.InlineKeyboardButton) int {
+	f.recordKB(rows)
+	id := f.add(text)
+	if f.kbFail {
+		return 0
+	}
+	return id
+}
+func (f *fakeMsg) SendEnt(_ context.Context, _ int64, text string, _ []models.MessageEntity, _ [][]models.InlineKeyboardButton) int {
+	return f.add(text)
+}
+func (f *fakeMsg) AnswerCallback(_ context.Context, _ string) {}
+func (f *fakeMsg) RefundStars(_ context.Context, userID int64, chargeID string) error {
+	f.refunds = append(f.refunds, fmt.Sprintf("%d:%s", userID, chargeID))
+	return f.refundErr
+}
+func (f *fakeMsg) StarTransactions(_ context.Context, offset, limit int) ([]models.StarTransaction, error) {
+	if offset >= len(f.starTx) {
+		return nil, nil
+	}
+	end := offset + limit
+	if end > len(f.starTx) {
+		end = len(f.starTx)
+	}
+	return f.starTx[offset:end], nil
+}
+func (f *fakeMsg) EditText(_ context.Context, _ int64, _ int, _ string, _ [][]models.InlineKeyboardButton) bool {
+	return false
+}
+func (f *fakeMsg) EditCaption(_ context.Context, _ int64, _ int, _ string, _ [][]models.InlineKeyboardButton) bool {
+	return false
+}
+func (f *fakeMsg) SendPhoto(_ context.Context, _ int64, _, caption string, rows [][]models.InlineKeyboardButton) int {
+	f.recordKB(rows)
+	return f.add(caption)
+}
+func (f *fakeMsg) SendPhotoCacheable(_ context.Context, _ int64, _ string, _ []byte, caption string, rows [][]models.InlineKeyboardButton) (int, string) {
+	f.recordKB(rows)
+	return f.add(caption), ""
+}
+func (f *fakeMsg) SendBanner(_ context.Context, _ int64, photo models.InputFile, caption string, _ []models.MessageEntity, _ models.ReplyMarkup) (int, error) {
+	// failBanner имитирует отказ Telegram на конкретной картинке (битый
+	// file_id или недоступная ссылка), failAllBanners — отказ на любой.
+	if f.failAllBanners {
+		return 0, errors.New("bad request, Bad Request: failed to send message")
+	}
+	if ref, ok := photo.(*models.InputFileString); ok && f.failBanner != "" && ref.Data == f.failBanner {
+		msg := f.failBannerErr
+		if msg == "" {
+			msg = "bad request, Bad Request: wrong remote file identifier specified: Wrong string length"
+		}
+		return 0, errors.New(msg)
+	}
+	return f.add(caption), nil
+}
+func (f *fakeMsg) Delete(_ context.Context, _ int64, id int) {
+	f.mu.Lock()
+	delete(f.live, id)
+	f.deleted = append(f.deleted, id)
+	f.mu.Unlock()
+}
+func (f *fakeMsg) RemoveKeyboard(_ context.Context, _ int64)               {}
+func (f *fakeMsg) SetCommandKeyboard(_ context.Context, _ int64, _ string) {}
+func (f *fakeMsg) SendInvoice(_ context.Context, _ int64, title, _, payload, currency string, amount int) {
+	f.mu.Lock()
+	f.invoices = append(f.invoices, currency+":"+strconv.Itoa(amount)+":"+payload)
+	f.mu.Unlock()
+}
+func (f *fakeMsg) CreateInvoiceLink(_ context.Context, _, _, payload, currency string, amount int) (string, error) {
+	return "https://t.me/$invoice_" + currency + "_" + strconv.Itoa(amount) + "_" + payload, nil
+}
+func (f *fakeMsg) AnswerPreCheckout(_ context.Context, _ string, ok bool, _ string) {
+	f.mu.Lock()
+	f.preOK = append(f.preOK, ok)
+	f.mu.Unlock()
+}
+
+// lastPreOK — ответ последней предпроверки (false, если её не было).
+func (f *fakeMsg) lastPreOK() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.preOK) == 0 {
+		return false
+	}
+	return f.preOK[len(f.preOK)-1]
+}
+
+func (f *fakeMsg) SendDocumentKB(_ context.Context, _ int64, doc models.InputFile, caption string, rm models.ReplyMarkup) int {
+	if kb, ok := rm.(*models.InlineKeyboardMarkup); ok && kb != nil {
+		f.recordKB(kb.InlineKeyboard)
+	}
+	switch d := doc.(type) {
+	case *models.InputFileString:
+		f.mu.Lock()
+		f.sentDocIDs = append(f.sentDocIDs, d.Data)
+		f.mu.Unlock()
+	case *models.InputFileUpload:
+		f.mu.Lock()
+		f.sentDocIDs = append(f.sentDocIDs, d.Filename)
+		f.mu.Unlock()
+	}
+	return f.add("DOCKB:" + caption)
+}
+
+func (f *fakeMsg) SendDocument(_ context.Context, _ int64, filename string, data []byte, _ string) {
+	f.mu.Lock()
+	if f.docs == nil {
+		f.docs = map[string][]byte{}
+	}
+	f.docs[filename] = append([]byte(nil), data...)
+	f.mu.Unlock()
+	f.add("DOC:" + filename)
+}
+func (f *fakeMsg) Download(_ context.Context, fileID string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.downloads[fileID]
+	if !ok {
+		return nil, errors.New("нет такого файла")
+	}
+	return data, nil
+}
+func (f *fakeMsg) add(s string) int {
+	if d := f.sendDelay; d > 0 {
+		time.Sleep(d)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.texts = append(f.texts, s)
+	f.seq++
+	if f.live == nil {
+		f.live = map[int]string{}
+	}
+	f.live[f.seq] = s
+	return f.seq
+}
+func (f *fakeMsg) liveCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.live) }
+func (f *fakeMsg) last() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.texts) == 0 {
+		return ""
+	}
+	return f.texts[len(f.texts)-1]
+}
+
+// lastLive — последнее НЕ удалённое сообщение: проверка «админ это увидит»,
+// а не «бот это отправил».
+func (f *fakeMsg) lastLive() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	best, out := 0, ""
+	for id, txt := range f.live {
+		if id > best {
+			best, out = id, txt
+		}
+	}
+	return out
+}
+
+func (f *fakeMsg) joined() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.texts, "\n---\n")
+}
+
+type fakeStore struct {
+	// mu защищает ДЕНЕЖНЫЕ пути фейка: реальное хранилище — база, и параллельные
+	// запросы там сериализует она. Тесты на гонку (двойное списание, двойной
+	// триал) без этого ловили бы гонку самого двойника, а не проверяемого кода.
+	// Остальные методы не заперты намеренно: они вызываются последовательно.
+	mu          sync.Mutex
+	cfg         *model.BotConfig
+	unreachable map[int64]string
+	// pingErr — ответ Ping: так проверяется, что «бот жив» смотрит на базу.
+	pingErr     error
+	users       map[int64]*model.User
+	reqs        map[int64]*model.P2PRequest
+	pays        map[int64]*model.Payment
+	media       map[string]string
+	pending     map[int64]*model.PendingInvoice
+	plans       map[string]*model.Plan
+	planAccess  map[string]model.PlanAccess
+	intents     map[int64]*model.PurchaseIntent
+	invSnaps    map[string]*model.PlanSnapshot
+	invSnapAt   map[string]string
+	promos      map[string]*model.PromoCode
+	trialResets map[int64]int
+	promoUses   map[string]bool
+	webUsers    map[string]*model.WebUser
+	mailTokens  map[string]*model.EmailToken
+	paylogs     []model.PayLogEntry
+	torrents    []model.TorrentReport
+	// failMark — столько ближайших вызовов MarkTorrentUnblockNotified упадут.
+	failMark int
+	strikes  map[int64]string
+	wlIDs    map[int64]bool
+	invites  map[string]*model.Invite
+	autopays map[int64]*model.AutoPay
+	seq      int64
+}
+
+func (s *fakeStore) WhitelistAllUsers(context.Context) (int64, error) {
+	var n int64
+	for _, u := range s.users {
+		if !u.Whitelisted {
+			u.Whitelisted = true
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) ClearWhitelistAll(context.Context) (int64, error) {
+	var n int64
+	for _, u := range s.users {
+		if u.Whitelisted {
+			u.Whitelisted = false
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) ListWhitelistedUsers(_ context.Context, limit, offset int) ([]model.User, int, error) {
+	var all []model.User
+	for _, u := range s.users {
+		if u.Whitelisted {
+			all = append(all, *u)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].TelegramID < all[j].TelegramID })
+	total := len(all)
+	if offset >= total {
+		return nil, total, nil
+	}
+	end := offset + limit
+	if limit <= 0 || end > total {
+		end = total
+	}
+	return all[offset:end], total, nil
+}
+
+func (s *fakeStore) ClearWhitelistIDs(context.Context) (int64, error) {
+	n := int64(len(s.wlIDs))
+	s.wlIDs = map[int64]bool{}
+	return n, nil
+}
+
+func (s *fakeStore) BalanceHeld(context.Context) (int64, int, error) {
+	var sum int64
+	n := 0
+	for _, u := range s.users {
+		if u.Balance > 0 {
+			sum += u.Balance
+			n++
+		}
+	}
+	return sum, n, nil
+}
+
+func (s *fakeStore) CountWhitelisted(context.Context) (int, error) {
+	n := 0
+	for _, u := range s.users {
+		if u.Whitelisted {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) CreateInvite(_ context.Context, inv *model.Invite) error {
+	if s.invites == nil {
+		s.invites = map[string]*model.Invite{}
+	}
+	cp := *inv
+	s.invites[inv.Code] = &cp
+	return nil
+}
+
+func (s *fakeStore) GetInvite(_ context.Context, code string) (*model.Invite, error) {
+	if s.invites == nil || s.invites[code] == nil {
+		return nil, nil
+	}
+	cp := *s.invites[code]
+	return &cp, nil
+}
+
+func (s *fakeStore) ListInvites(context.Context) ([]model.Invite, error) {
+	var out []model.Invite
+	for _, inv := range s.invites {
+		out = append(out, *inv)
+	}
+	return out, nil
+}
+
+func (s *fakeStore) UseInvite(_ context.Context, code string) (bool, error) {
+	inv := s.invites[code]
+	if inv == nil || !inv.Active(time.Now().UTC()) {
+		return false, nil
+	}
+	inv.Used++
+	return true, nil
+}
+
+func (s *fakeStore) RevokeInvite(_ context.Context, code string) error {
+	if inv := s.invites[code]; inv != nil {
+		inv.Revoked = true
+	}
+	return nil
+}
+
+func (s *fakeStore) DeleteInvite(_ context.Context, code string) error {
+	delete(s.invites, code)
+	return nil
+}
+
+func (s *fakeStore) SetAutoPay(_ context.Context, ap *model.AutoPay) error {
+	if s.autopays == nil {
+		s.autopays = map[int64]*model.AutoPay{}
+	}
+	cp := *ap
+	s.autopays[ap.TelegramID] = &cp
+	return nil
+}
+
+func (s *fakeStore) UpdateAutoPaySnapshot(_ context.Context, id int64, snap *model.PlanSnapshot) error {
+	if ap := s.autopays[id]; ap != nil {
+		ap.Snapshot = snap
+	}
+	return nil
+}
+
+func (s *fakeStore) GetAutoPay(_ context.Context, id int64) (*model.AutoPay, error) {
+	if s.autopays == nil || s.autopays[id] == nil {
+		return nil, nil
+	}
+	cp := *s.autopays[id]
+	return &cp, nil
+}
+
+func (s *fakeStore) SetAutoPayEnabled(_ context.Context, id int64, on bool) error {
+	if ap := s.autopays[id]; ap != nil {
+		ap.Enabled = on
+		ap.Fails = 0
+		ap.LastError = ""
+	}
+	return nil
+}
+
+func (s *fakeStore) UpdateAutoPayResult(_ context.Context, id int64, lastPayAt, nextTryAt string, fails int, lastError string) error {
+	if ap := s.autopays[id]; ap != nil {
+		ap.LastPayAt = lastPayAt
+		ap.NextTryAt = nextTryAt
+		ap.Fails = fails
+		ap.LastError = lastError
+	}
+	return nil
+}
+
+func (s *fakeStore) MarkAutoPayCharged(_ context.Context, id int64, lastPayAt, paidPeriod, nextTryAt, lastError string) error {
+	if ap := s.autopays[id]; ap != nil {
+		ap.LastPayAt = lastPayAt
+		ap.PaidPeriod = paidPeriod
+		ap.NextTryAt = nextTryAt
+		ap.Fails = 0
+		ap.LastError = lastError
+	}
+	return nil
+}
+
+func (s *fakeStore) ListAutoPay(context.Context) ([]model.AutoPay, error) {
+	var out []model.AutoPay
+	for _, ap := range s.autopays {
+		out = append(out, *ap)
+	}
+	return out, nil
+}
+
+func (s *fakeStore) DeleteAutoPay(_ context.Context, id int64) error {
+	delete(s.autopays, id)
+	return nil
+}
+
+func (s *fakeStore) Migrate(context.Context) error { return nil }
+
+func (s *fakeStore) GetScreenMsg(context.Context, int64) (int, error) { return 0, nil }
+func (s *fakeStore) SetScreenMsg(context.Context, int64, int) error   { return nil }
+
+func (s *fakeStore) AddPayLog(_ context.Context, e *model.PayLogEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.paylogs = append(s.paylogs, *e)
+	return nil
+}
+
+func (s *fakeStore) PayLogs(_ context.Context, extID string, telegramID int64, _ int) ([]model.PayLogEntry, error) {
+	var out []model.PayLogEntry
+	for _, e := range s.paylogs {
+		if (extID != "" && e.ExtID == extID) || (telegramID > 0 && e.TelegramID == telegramID) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) AllPayLogs(_ context.Context, limit int) ([]model.PayLogEntry, error) {
+	out := append([]model.PayLogEntry(nil), s.paylogs...)
+	return out, nil
+}
+
+func (s *fakeStore) PayLogsFiltered(_ context.Context, stages []string, since string, limit int) ([]model.PayLogEntry, int64, error) {
+	allow := map[string]bool{}
+	for _, st := range stages {
+		allow[st] = true
+	}
+	var matched []model.PayLogEntry
+	for i := len(s.paylogs) - 1; i >= 0; i-- { // новые первыми, как в БД
+		e := s.paylogs[i]
+		if len(allow) > 0 && !allow[e.Stage] {
+			continue
+		}
+		if since != "" && e.CreatedAt != "" && e.CreatedAt < since {
+			continue
+		}
+		matched = append(matched, e)
+	}
+	total := int64(len(matched))
+	if limit > 0 && len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, total, nil
+}
+
+func (s *fakeStore) PurgePayLogs(_ context.Context, _ string) error { return nil }
+
+func (s *fakeStore) AddTorrentReport(_ context.Context, r *model.TorrentReport) error {
+	if r.ID == 0 {
+		s.seq++
+		r.ID = s.seq
+	}
+	if r.CreatedAt == "" {
+		r.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	// Хранилище вставляет с ON CONFLICT (id) DO NOTHING — фейк обязан вести
+	// себя так же, иначе идемпотентность журнала ничем не проверяется.
+	for _, ex := range s.torrents {
+		if ex.ID == r.ID {
+			return nil
+		}
+	}
+	s.torrents = append(s.torrents, *r)
+	return nil
+}
+
+func (s *fakeStore) TorrentReports(_ context.Context, limit, offset int) ([]model.TorrentReport, int, error) {
+	var all []model.TorrentReport
+	for i := len(s.torrents) - 1; i >= 0; i-- { // новые первыми, как в БД
+		all = append(all, s.torrents[i])
+	}
+	total := len(all)
+	if offset >= len(all) {
+		return nil, total, nil
+	}
+	all = all[offset:]
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+	return all, total, nil
+}
+
+func (s *fakeStore) CountTorrentReports(_ context.Context, telegramID int64, username, since string) (int, error) {
+	n := 0
+	for _, r := range s.torrents {
+		if since != "" && r.CreatedAt < since {
+			continue
+		}
+		if (telegramID != 0 && r.TelegramID == telegramID) ||
+			(telegramID == 0 && username != "" && r.Username == username) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) DueTorrentUnblocks(_ context.Context, now string) ([]model.TorrentReport, error) {
+	var out []model.TorrentReport
+	for _, r := range s.torrents {
+		if !r.UnblockNotified && r.TelegramID != 0 && r.WillUnblockAt != "" && r.WillUnblockAt <= now {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) PendingTorrentUnblocksByIP(_ context.Context, ip string) ([]model.TorrentReport, error) {
+	var out []model.TorrentReport
+	for _, r := range s.torrents {
+		if !r.UnblockNotified && r.IP == ip {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) MarkTorrentUnblockNotified(_ context.Context, id int64) error {
+	if s.failMark > 0 {
+		s.failMark--
+		return errors.New("хранилище недоступно")
+	}
+	for i := range s.torrents {
+		if s.torrents[i].ID == id {
+			s.torrents[i].UnblockNotified = true
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) CountTorrentReportsAll(_ context.Context, since string) (int, error) {
+	n := 0
+	for _, r := range s.torrents {
+		if since == "" || r.CreatedAt >= since {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) UserTorrentReports(_ context.Context, telegramID int64, username string, limit, offset int) ([]model.TorrentReport, int, error) {
+	var all []model.TorrentReport
+	for i := len(s.torrents) - 1; i >= 0; i-- { // новые первыми, как в БД
+		r := s.torrents[i]
+		if (telegramID != 0 && r.TelegramID == telegramID) ||
+			(telegramID == 0 && username != "" && r.Username == username) {
+			all = append(all, r)
+		}
+	}
+	total := len(all)
+	if offset >= total {
+		return nil, total, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return all[offset:end], total, nil
+}
+
+func (s *fakeStore) SetTorrentStrike(_ context.Context, telegramID int64, at string) error {
+	if s.strikes == nil {
+		s.strikes = map[int64]string{}
+	}
+	s.strikes[telegramID] = at
+	return nil
+}
+
+func (s *fakeStore) TorrentStrikeAt(_ context.Context, telegramID int64) (string, error) {
+	return s.strikes[telegramID], nil
+}
+
+func (s *fakeStore) PurgeTorrentReports(_ context.Context, _ string) error { return nil }
+func (s *fakeStore) LoadConfig(context.Context) (*model.BotConfig, bool, error) {
+	if s.cfg == nil {
+		return nil, false, nil
+	}
+	cp := *s.cfg
+	return &cp, true, nil
+}
+func (s *fakeStore) SaveConfig(_ context.Context, c *model.BotConfig) error {
+	cp := *c
+	s.cfg = &cp
+	return nil
+}
+func (s *fakeStore) UpsertUser(_ context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[id] == nil {
+		s.users[id] = &model.User{TelegramID: id}
+	}
+	return nil
+}
+func (s *fakeStore) GetUser(_ context.Context, id int64) (*model.User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil || s.users[id] == nil {
+		return nil, nil
+	}
+	cp := *s.users[id]
+	return &cp, nil
+}
+
+func (s *fakeStore) ListSubRepairTargets(_ context.Context) ([]storage.SubRepairTarget, error) {
+	var out []storage.SubRepairTarget
+	for id, u := range s.users {
+		if u == nil || u.SubExpireAt == "" || u.Blocked {
+			continue
+		}
+		out = append(out, storage.SubRepairTarget{TelegramID: id, SubExpireAt: u.SubExpireAt})
+	}
+	return out, nil
+}
+
+func (s *fakeStore) SetTrafficBonus(_ context.Context, id int64, b *model.TrafficBonus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil || s.users[id] == nil {
+		return nil
+	}
+	if b.Encode() == "" {
+		s.users[id].TrafficBonus = nil
+		return nil
+	}
+	cp := *b
+	s.users[id].TrafficBonus = &cp
+	return nil
+}
+
+func (s *fakeStore) ListTrafficBonuses(_ context.Context, limit int) ([]storage.TrafficBonusTarget, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []storage.TrafficBonusTarget
+	for id, u := range s.users {
+		if u == nil || u.TrafficBonus == nil {
+			continue
+		}
+		cp := *u.TrafficBonus
+		out = append(out, storage.TrafficBonusTarget{TelegramID: id, Bonus: &cp})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) TrialResets(_ context.Context, id int64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.trialResets[id], nil
+}
+
+func (s *fakeStore) ListTrialResetTargets(_ context.Context, maxResets, limit int) ([]storage.TrialResetTarget, error) {
+	if maxResets <= 0 || limit <= 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	paid := map[int64]bool{}
+	for _, p := range s.pays {
+		if p != nil && p.Method != model.PayMethodTrial &&
+			(p.Status == model.PaymentPaid || p.Status == model.PaymentRefunded) {
+			paid[p.TelegramID] = true
+		}
+	}
+	var out []storage.TrialResetTarget
+	for id, u := range s.users {
+		if u == nil || u.Blocked || id <= 0 || u.TrialUsedAt == "" || u.SubExpireAt == "" || paid[id] {
+			continue
+		}
+		if s.unreachable[id] != "" {
+			continue
+		}
+		if s.trialResets[id] >= maxResets {
+			continue
+		}
+		out = append(out, storage.TrialResetTarget{TelegramID: id, SubExpireAt: u.SubExpireAt, Resets: s.trialResets[id]})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) ResetTrialForRepeat(_ context.Context, id int64, expectExpire string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.users[id]
+	if u == nil || u.TrialUsedAt == "" || expectExpire == "" || u.SubExpireAt != expectExpire {
+		return false, nil
+	}
+	u.TrialUsedAt, u.SubExpireAt, u.NotifyKind, u.NotifySent = "", "", "", ""
+	if s.trialResets == nil {
+		s.trialResets = map[int64]int{}
+	}
+	s.trialResets[id]++
+	return true, nil
+}
+
+func (s *fakeStore) LastPaidSubPayment(_ context.Context, id int64) (*model.Payment, error) {
+	var last *model.Payment
+	for _, p := range s.pays {
+		if p == nil || p.TelegramID != id || p.Status != model.PaymentPaid || p.Months <= 0 {
+			continue
+		}
+		if last == nil || p.ID >= last.ID {
+			last = p
+		}
+	}
+	return last, nil
+}
+
+func (s *fakeStore) SetPaymentSnapshot(_ context.Context, id int64, snap *model.PlanSnapshot) error {
+	for _, p := range s.pays {
+		if p != nil && p.ID == id {
+			p.Snapshot = snap
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) SetUserSnapshot(_ context.Context, id int64, snap *model.PlanSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[id] == nil {
+		s.users[id] = &model.User{TelegramID: id}
+	}
+	s.users[id].Snapshot = snap
+	return nil
+}
+
+func (s *fakeStore) SetUserInfo(_ context.Context, id int64, username, firstName string) error {
+	if s.users == nil || s.users[id] == nil {
+		return nil
+	}
+	s.users[id].Username = username
+	s.users[id].FirstName = firstName
+	return nil
+}
+
+func (s *fakeStore) HasApprovedPurchase(_ context.Context, id int64) (bool, error) {
+	for _, r := range s.reqs {
+		if r.TelegramID == id && r.Status == model.P2PApproved {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AddPaymentAndBalance — фейк той же атомарности: барьер по ext_id срабатывает
+// ДО денег, и при дубле баланс не трогается вовсе.
+func (s *fakeStore) SetPaymentStatus(_ context.Context, extID, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.pays {
+		if p.ExtID != "" && p.ExtID == extID {
+			p.Status = status
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) AddPaymentAndBalance(ctx context.Context, p *model.Payment, kopecks int64) error {
+	// Своего замка нет намеренно: обе половины запирают его сами, а он не
+	// реентерабельный. Для теста важно, что барьер по ext_id внутри AddPayment
+	// атомарен — при гонке дубль получает ровно один из двух вызовов.
+	if err := s.AddPayment(ctx, p); err != nil {
+		return err
+	}
+	if kopecks != 0 {
+		return s.AddBalance(ctx, p.TelegramID, kopecks)
+	}
+	return nil
+}
+
+func (s *fakeStore) AddPayment(_ context.Context, p *model.Payment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pays == nil {
+		s.pays = map[int64]*model.Payment{}
+	}
+
+	if p.ExtID != "" {
+		for _, x := range s.pays {
+			if x.Method == p.Method && x.ExtID == p.ExtID {
+				return storage.ErrDuplicateExtID
+			}
+		}
+	}
+	if p.ID == 0 {
+		s.seq++
+		p.ID = s.seq
+	}
+	cp := *p
+	s.pays[p.ID] = &cp
+	return nil
+}
+func (s *fakeStore) ListPayments(_ context.Context, limit, offset int) ([]model.Payment, int, error) {
+	var all []model.Payment
+	for _, p := range s.pays {
+		all = append(all, *p)
+	}
+	total := len(all)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return all[offset:end], total, nil
+}
+func (s *fakeStore) HasPaidPayment(_ context.Context, id int64) (bool, error) {
+	for _, p := range s.pays {
+		if p.TelegramID == id && p.Status == model.PaymentPaid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (s *fakeStore) PaidPayments(_ context.Context) ([]model.Payment, error) {
+	var out []model.Payment
+	for _, p := range s.pays {
+		if p.Status == model.PaymentPaid {
+			out = append(out, *p)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) MostPopularPlan(_ context.Context) (int, int, error) {
+	counts := map[int]int{}
+	total := 0
+	for _, p := range s.pays {
+		if p.Status == model.PaymentPaid {
+			counts[p.Months]++
+			total++
+		}
+	}
+	best := 0
+	bestN := 0
+	for mo, n := range counts {
+		if n > bestN || (n == bestN && (best == 0 || mo < best)) {
+			best = mo
+			bestN = n
+		}
+	}
+	return best, total, nil
+}
+func (s *fakeStore) PaymentByExtID(_ context.Context, extID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if extID == "" {
+		return false, nil
+	}
+	for _, p := range s.pays {
+		if p.ExtID == extID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func (s *fakeStore) SetP2PApproved(_ context.Context, id int64, ok bool) error {
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[id] == nil {
+		s.users[id] = &model.User{TelegramID: id}
+	}
+	s.users[id].P2PApproved = ok
+	return nil
+}
+
+func (s *fakeStore) ListUsers(_ context.Context, limit, offset int) ([]model.User, int, error) {
+	var all []model.User
+	for _, u := range s.users {
+		all = append(all, *u)
+	}
+	total := len(all)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return all[offset:end], total, nil
+}
+func (s *fakeStore) SearchUsers(_ context.Context, q string, limit, offset int) ([]model.User, int, error) {
+	q = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(q), "@"))
+	if q == "" {
+		return nil, 0, nil
+	}
+	var all []model.User
+	for _, u := range s.users {
+		hay := strings.ToLower(u.Username + " " + u.FirstName + " " + strconv.FormatInt(u.TelegramID, 10))
+		if strings.Contains(hay, q) {
+			all = append(all, *u)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].TelegramID < all[j].TelegramID })
+	total := len(all)
+	if offset >= total {
+		return nil, total, nil
+	}
+	end := offset + limit
+	if limit <= 0 || end > total {
+		end = total
+	}
+	return all[offset:end], total, nil
+}
+
+func (s *fakeStore) Ping(_ context.Context) error { return s.pingErr }
+func (s *fakeStore) ListP2PRequestsByStatus(_ context.Context, status string, limit int) ([]model.P2PRequest, error) {
+	var out []model.P2PRequest
+	for _, r := range s.reqs {
+		if r.Status == status {
+			out = append(out, *r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+func (s *fakeStore) SetUnreachable(_ context.Context, id int64, at string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unreachable == nil {
+		s.unreachable = map[int64]string{}
+	}
+	s.unreachable[id] = at
+	return nil
+}
+func (s *fakeStore) SetBlocked(_ context.Context, id int64, blocked bool) error {
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[id] == nil {
+		s.users[id] = &model.User{TelegramID: id}
+	}
+	s.users[id].Blocked = blocked
+	return nil
+}
+func (s *fakeStore) DeleteUser(_ context.Context, id int64) error {
+	delete(s.users, id)
+	return nil
+}
+
+func (s *fakeStore) DeletePaymentsByUser(_ context.Context, id int64) error {
+	for k, p := range s.pays {
+		if p.TelegramID == id {
+			delete(s.pays, k)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) DeleteP2PRequestsByUser(_ context.Context, id int64) error {
+	for k, r := range s.reqs {
+		if r.TelegramID == id {
+			delete(s.reqs, k)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) SetTermsAccepted(_ context.Context, telegramID int64, ts string) error {
+	if u, ok := s.users[telegramID]; ok {
+		u.TermsAcceptedAt = ts
+	}
+	return nil
+}
+
+func (s *fakeStore) ResetTermsAccepted(_ context.Context) error {
+	for _, u := range s.users {
+		u.TermsAcceptedAt = ""
+	}
+	return nil
+}
+
+func (s *fakeStore) SetTrialUsed(_ context.Context, telegramID int64, ts string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.users[telegramID]; ok {
+		u.TrialUsedAt = ts
+	}
+	return nil
+}
+func (s *fakeStore) SetSubExpiry(_ context.Context, telegramID int64, expireAt, kind string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[telegramID] == nil {
+		s.users[telegramID] = &model.User{TelegramID: telegramID}
+	}
+	s.users[telegramID].SubExpireAt = expireAt
+	s.users[telegramID].NotifyKind = kind
+	s.users[telegramID].NotifySent = ""
+	return nil
+}
+func (s *fakeStore) MarkNotified(_ context.Context, telegramID int64, sentCSV string) error {
+	if u, ok := s.users[telegramID]; ok {
+		u.NotifySent = sentCSV
+	}
+	return nil
+}
+func (s *fakeStore) UsersForNotify(_ context.Context) ([]model.User, error) {
+	var out []model.User
+	for _, u := range s.users {
+		if u.SubExpireAt != "" {
+			out = append(out, *u)
+		}
+	}
+	return out, nil
+}
+func (s *fakeStore) AddBalance(_ context.Context, id int64, kopecks int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[id] == nil {
+		s.users[id] = &model.User{TelegramID: id}
+	}
+	s.users[id].Balance += kopecks
+	return nil
+}
+func (s *fakeStore) DeductBalance(_ context.Context, id int64, kopecks int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.users[id]
+	if u == nil || u.Balance < kopecks || kopecks <= 0 {
+		return false, nil
+	}
+	u.Balance -= kopecks
+	return true, nil
+}
+func (s *fakeStore) SetReferredBy(_ context.Context, id, ref int64) error {
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[id] == nil {
+		s.users[id] = &model.User{TelegramID: id}
+	}
+	if s.users[id].ReferredBy == 0 {
+		s.users[id].ReferredBy = ref
+	}
+	return nil
+}
+func (s *fakeStore) SetRefBonusPaid(_ context.Context, id int64) error {
+	if s.users != nil && s.users[id] != nil {
+		s.users[id].RefBonusPaid = true
+	}
+	return nil
+}
+func (s *fakeStore) AddRefEarned(_ context.Context, id int64, kopecks int64) error {
+	if s.users == nil {
+		s.users = map[int64]*model.User{}
+	}
+	if s.users[id] == nil {
+		s.users[id] = &model.User{TelegramID: id}
+	}
+	s.users[id].RefEarned += kopecks
+	return nil
+}
+func (s *fakeStore) CreateWebUser(_ context.Context, u *model.WebUser) error {
+	if s.webUsers == nil {
+		s.webUsers = map[string]*model.WebUser{}
+	}
+	cp := *u
+	s.webUsers[u.Email] = &cp
+	return nil
+}
+func (s *fakeStore) GetWebUserByTgID(_ context.Context, tgID int64) (*model.WebUser, error) {
+	for _, u := range s.webUsers {
+		if u.TgID == tgID {
+			cp := *u
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+func (s *fakeStore) SetWebUserVerified(_ context.Context, tgID int64, at string) error {
+	if at == "" {
+		at = "2026-01-01T00:00:00Z"
+	}
+	for _, u := range s.webUsers {
+		if u.TgID == tgID {
+			u.VerifiedAt = at
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) SetWebUserPassword(_ context.Context, tgID int64, hash string) error {
+	for _, u := range s.webUsers {
+		if u.TgID == tgID {
+			u.PassHash = hash
+			return nil
+		}
+	}
+	return sql.ErrNoRows
+}
+
+func (s *fakeStore) UserSessEpoch(_ context.Context, tgID int64) (int, error) {
+	if s.users != nil && s.users[tgID] != nil {
+		return s.users[tgID].SessEpoch, nil
+	}
+	return 0, nil
+}
+
+func (s *fakeStore) BumpSessEpoch(_ context.Context, tgID int64) (int, error) {
+	if s.users != nil && s.users[tgID] != nil {
+		s.users[tgID].SessEpoch++
+		return s.users[tgID].SessEpoch, nil
+	}
+	return 0, nil
+}
+
+func (s *fakeStore) PutEmailToken(_ context.Context, t *model.EmailToken) error {
+	if s.mailTokens == nil {
+		s.mailTokens = map[string]*model.EmailToken{}
+	}
+	cp := *t
+	s.mailTokens[t.Hash] = &cp
+	return nil
+}
+
+func (s *fakeStore) TakeEmailToken(_ context.Context, hash, purpose string) (*model.EmailToken, error) {
+	t := s.mailTokens[hash]
+	if t == nil || t.Purpose != purpose || t.UsedAt != "" {
+		return nil, nil
+	}
+	if t.ExpiresAt != "" && t.ExpiresAt < time.Now().UTC().Format(time.RFC3339) {
+		return nil, nil
+	}
+	t.UsedAt = time.Now().UTC().Format(time.RFC3339)
+	cp := *t
+	return &cp, nil
+}
+
+func (s *fakeStore) RevokeEmailTokens(_ context.Context, tgID int64, purpose string) error {
+	for _, t := range s.mailTokens {
+		if t.TgID == tgID && t.Purpose == purpose && t.UsedAt == "" {
+			t.UsedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) CountEmailTokensSince(_ context.Context, tgID int64, purpose, since string) (int, error) {
+	n := 0
+	for _, t := range s.mailTokens {
+		if t.TgID == tgID && t.Purpose == purpose && t.CreatedAt > since {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) PurgeEmailTokens(_ context.Context, before string) error {
+	for h, t := range s.mailTokens {
+		if t.ExpiresAt < before {
+			delete(s.mailTokens, h)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) AccountFootprint(_ context.Context, tgID int64) (storage.AccountFootprint, error) {
+	var fp storage.AccountFootprint
+	if u := s.users[tgID]; u != nil {
+		fp.HasRow = true
+		fp.Active = u.Balance != 0 || u.SubExpireAt != "" || u.TrialUsedAt != "" || u.TermsAcceptedAt != "" ||
+			u.ReferredBy != 0 || u.RefEarned != 0 || u.Whitelisted || u.WebApproved || u.WebDenied || u.P2PApproved
+	}
+	if fp.Active {
+		return fp, nil
+	}
+	for _, p := range s.pays {
+		if p.TelegramID == tgID {
+			fp.Active = true
+			return fp, nil
+		}
+	}
+	for _, r := range s.reqs {
+		if r.TelegramID == tgID {
+			fp.Active = true
+			return fp, nil
+		}
+	}
+	if s.autopays[tgID] != nil {
+		fp.Active = true
+	}
+	for _, u := range s.webUsers {
+		if u.TgID == tgID {
+			fp.Active = true
+		}
+	}
+	return fp, nil
+}
+
+func (s *fakeStore) MoveAccount(_ context.Context, from, to int64) error {
+	if u := s.users[from]; u != nil {
+		delete(s.users, from)
+		u.TelegramID = to
+		s.users[to] = u
+	}
+	for _, u := range s.webUsers {
+		if u.TgID == from {
+			u.TgID = to
+		}
+	}
+	for _, p := range s.pays {
+		if p.TelegramID == from {
+			p.TelegramID = to
+		}
+	}
+	for _, r := range s.reqs {
+		if r.TelegramID == from {
+			r.TelegramID = to
+		}
+	}
+	if ap := s.autopays[from]; ap != nil {
+		delete(s.autopays, from)
+		ap.TelegramID = to
+		s.autopays[to] = ap
+	}
+	return nil
+}
+
+func (s *fakeStore) SetWebApproved(_ context.Context, tgID int64, approved bool) error {
+	if s.users != nil && s.users[tgID] != nil {
+		s.users[tgID].WebApproved = approved
+	}
+	return nil
+}
+func (s *fakeStore) SetWebDenied(_ context.Context, tgID int64, denied bool) error {
+	if s.users != nil && s.users[tgID] != nil {
+		s.users[tgID].WebDenied = denied
+	}
+	return nil
+}
+func (s *fakeStore) GetWebUserByEmail(_ context.Context, email string) (*model.WebUser, error) {
+	if s.webUsers != nil {
+		if u, ok := s.webUsers[email]; ok {
+			cp := *u
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+func (s *fakeStore) SetPurchaseIntent(_ context.Context, in *model.PurchaseIntent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if in == nil {
+		return nil
+	}
+	if s.intents == nil {
+		s.intents = map[int64]*model.PurchaseIntent{}
+	}
+	cp := *in
+	// Настоящее хранилище проставляет время само; без этого срок жизни выбора
+	// в тестах не работал бы вовсе.
+	if cp.CreatedAt == "" {
+		cp.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	in.CreatedAt = cp.CreatedAt
+	s.intents[cp.TelegramID] = &cp
+	return nil
+}
+
+func invSnapKey(telegramID int64, method string, months int) string {
+	return strconv.FormatInt(telegramID, 10) + ":" + method + ":" + strconv.Itoa(months)
+}
+
+func (s *fakeStore) SetInvoiceSnapshot(_ context.Context, telegramID int64, method string, months int, snap *model.PlanSnapshot) error {
+	if s.invSnaps == nil {
+		s.invSnaps = map[string]*model.PlanSnapshot{}
+		s.invSnapAt = map[string]string{}
+	}
+	// Настоящее хранилище на пустом снимке пишет пустую строку, то есть
+	// затирает условия. Фейк обязан вести себя так же, иначе расхождение
+	// вылезет только в бою.
+	if snap == nil {
+		k := invSnapKey(telegramID, method, months)
+		delete(s.invSnaps, k)
+		delete(s.invSnapAt, k)
+		return nil
+	}
+	cp := *snap
+	k := invSnapKey(telegramID, method, months)
+	s.invSnaps[k] = &cp
+	s.invSnapAt[k] = time.Now().UTC().Format(time.RFC3339)
+	return nil
+}
+
+func (s *fakeStore) InvoiceSnapshot(_ context.Context, telegramID int64, method string, months int) (*model.PlanSnapshot, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := invSnapKey(telegramID, method, months)
+	v := s.invSnaps[k]
+	if v == nil {
+		return nil, "", nil
+	}
+	cp := *v
+	return &cp, s.invSnapAt[k], nil
+}
+
+func (s *fakeStore) PurgeInvoiceSnapshots(_ context.Context, before string) error {
+	for k, at := range s.invSnapAt {
+		if at < before {
+			delete(s.invSnapAt, k)
+			delete(s.invSnaps, k)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) DeleteInvoiceSnapshot(_ context.Context, telegramID int64, method string, months int) error {
+	k := invSnapKey(telegramID, method, months)
+	delete(s.invSnaps, k)
+	delete(s.invSnapAt, k)
+	return nil
+}
+
+func (s *fakeStore) PurchaseIntent(_ context.Context, telegramID int64) (*model.PurchaseIntent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.intents == nil || s.intents[telegramID] == nil {
+		return nil, nil
+	}
+	cp := *s.intents[telegramID]
+	return &cp, nil
+}
+
+func (s *fakeStore) DeletePurchaseIntent(_ context.Context, telegramID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.intents, telegramID)
+	return nil
+}
+
+func (s *fakeStore) DeletePurchaseIntentFor(_ context.Context, telegramID int64, months int, createdAt string) error {
+	if in := s.intents[telegramID]; in != nil && in.Months == months && in.CreatedAt == createdAt {
+		delete(s.intents, telegramID)
+	}
+	return nil
+}
+
+func (s *fakeStore) SavePlan(_ context.Context, p *model.Plan) error {
+	if p == nil {
+		return nil
+	}
+	if s.plans == nil {
+		s.plans = map[string]*model.Plan{}
+	}
+	cp := *p
+	cp.Normalize()
+	s.plans[cp.Code] = &cp
+	return nil
+}
+
+func (s *fakeStore) GetPlan(_ context.Context, code string) (*model.Plan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.plans == nil || s.plans[code] == nil {
+		return nil, nil
+	}
+	cp := *s.plans[code]
+	return &cp, nil
+}
+
+func (s *fakeStore) ListPlans(context.Context) ([]model.Plan, error) {
+	out := make([]model.Plan, 0, len(s.plans))
+	for _, p := range s.plans {
+		out = append(out, *p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Order != out[j].Order {
+			return out[i].Order < out[j].Order
+		}
+		return out[i].Code < out[j].Code
+	})
+	return out, nil
+}
+
+func (s *fakeStore) DeletePlan(_ context.Context, code string) error {
+	delete(s.plans, code)
+	for k := range s.planAccess {
+		if s.planAccess[k].PlanCode == code {
+			delete(s.planAccess, k)
+		}
+	}
+	return nil
+}
+
+// planAccessKey повторяет первичный ключ настоящей таблицы.
+func planAccessKey(code string, tgID int64, email string) string {
+	return code + "|" + strconv.FormatInt(tgID, 10) + "|" + model.NormalizeEmail(email)
+}
+
+func (s *fakeStore) GrantPlanAccess(_ context.Context, code string, tgID int64, email string) error {
+	email = model.NormalizeEmail(email)
+	if !model.ValidPlanCode(code) || (tgID == 0) == (email == "") {
+		return errors.New("недопустимая запись списка допущенных")
+	}
+	if s.planAccess == nil {
+		s.planAccess = map[string]model.PlanAccess{}
+	}
+	k := planAccessKey(code, tgID, email)
+	if _, ok := s.planAccess[k]; ok {
+		return nil
+	}
+	s.seq++
+	s.planAccess[k] = model.PlanAccess{
+		PlanCode: code, TelegramID: tgID, Email: email,
+		CreatedAt: time.Now().UTC().Add(time.Duration(s.seq) * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	return nil
+}
+
+func (s *fakeStore) RevokePlanAccess(_ context.Context, code string, tgID int64, email string) error {
+	delete(s.planAccess, planAccessKey(code, tgID, email))
+	return nil
+}
+
+func (s *fakeStore) HasPlanAccess(_ context.Context, code string, tgID int64, email string) (bool, error) {
+	email = model.NormalizeEmail(email)
+	for _, e := range s.planAccess {
+		if e.PlanCode != code {
+			continue
+		}
+		if (e.TelegramID != 0 && e.TelegramID == tgID) || (e.Email != "" && e.Email == email) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *fakeStore) ListPlanAccess(_ context.Context, code string) ([]model.PlanAccess, error) {
+	var out []model.PlanAccess
+	for _, e := range s.planAccess {
+		if e.PlanCode == code {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+		if out[i].TelegramID != out[j].TelegramID {
+			return out[i].TelegramID < out[j].TelegramID
+		}
+		return out[i].Email < out[j].Email
+	})
+	return out, nil
+}
+
+func (s *fakeStore) ListAllPlanAccess(context.Context) ([]model.PlanAccess, error) {
+	var out []model.PlanAccess
+	for _, e := range s.planAccess {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].PlanCode != out[j].PlanCode {
+			return out[i].PlanCode < out[j].PlanCode
+		}
+		return out[i].CreatedAt < out[j].CreatedAt
+	})
+	return out, nil
+}
+
+func (s *fakeStore) ClearPlanAccess(_ context.Context, code string) error {
+	for k := range s.planAccess {
+		if s.planAccess[k].PlanCode == code {
+			delete(s.planAccess, k)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) PrunePlanAccess(context.Context) error {
+	for k := range s.planAccess {
+		if s.plans[s.planAccess[k].PlanCode] == nil {
+			delete(s.planAccess, k)
+		}
+	}
+	return nil
+}
+
+func (s *fakeStore) CountUsersOnPlan(_ context.Context, code, activeAfter string) (int, error) {
+	n := 0
+	for _, u := range s.users {
+		if u != nil && u.Snapshot != nil && u.Snapshot.Code == code && u.SubExpireAt > activeAfter {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *fakeStore) CreatePromo(_ context.Context, p *model.PromoCode) error {
+	if s.promos == nil {
+		s.promos = map[string]*model.PromoCode{}
+	}
+	cp := *p
+	s.promos[p.Code] = &cp
+	return nil
+}
+func (s *fakeStore) GetPromo(_ context.Context, code string) (*model.PromoCode, error) {
+	if s.promos == nil || s.promos[code] == nil {
+		return nil, nil
+	}
+	cp := *s.promos[code]
+	return &cp, nil
+}
+func (s *fakeStore) ListPromos(_ context.Context) ([]model.PromoCode, error) {
+	var out []model.PromoCode
+	for _, p := range s.promos {
+		out = append(out, *p)
+	}
+	return out, nil
+}
+func (s *fakeStore) DeletePromo(_ context.Context, code string) error {
+	delete(s.promos, code)
+	return nil
+}
+func (s *fakeStore) PromoRedeemedBy(_ context.Context, code string, id int64) (bool, error) {
+	return s.promoUses[code+"|"+itoa64(id)], nil
+}
+func (s *fakeStore) RedeemPromo(_ context.Context, code string, id int64) (bool, error) {
+	if s.promoUses == nil {
+		s.promoUses = map[string]bool{}
+	}
+	key := code + "|" + itoa64(id)
+	if s.promoUses[key] {
+		return false, nil
+	}
+	p := s.promos[code]
+	if p != nil && p.MaxUses > 0 && p.Used >= p.MaxUses {
+		return false, nil
+	}
+	s.promoUses[key] = true
+	if p != nil {
+		p.Used++
+	}
+	return true, nil
+}
+func (s *fakeStore) ReleasePromo(ctx context.Context, code string, id int64) error {
+	// Отменённый контекст двойник обязан уважать: на нём и ломалась
+	// компенсация промокода в бою.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	delete(s.promoUses, code+"|"+itoa64(id))
+	if p := s.promos[code]; p != nil && p.Used > 0 {
+		p.Used--
+	}
+	return nil
+}
+func (s *fakeStore) SetWhitelisted(_ context.Context, id int64, on bool) error {
+	if s.users != nil && s.users[id] != nil {
+		s.users[id].Whitelisted = on
+	}
+	return nil
+}
+func (s *fakeStore) AddWhitelistID(_ context.Context, id int64) error {
+	if s.wlIDs == nil {
+		s.wlIDs = map[int64]bool{}
+	}
+	s.wlIDs[id] = true
+	return nil
+}
+func (s *fakeStore) RemoveWhitelistID(_ context.Context, id int64) error {
+	delete(s.wlIDs, id)
+	return nil
+}
+func (s *fakeStore) IsWhitelistID(_ context.Context, id int64) (bool, error) {
+	return s.wlIDs[id], nil
+}
+func (s *fakeStore) ListWhitelistIDs(_ context.Context) ([]int64, error) {
+	var ids []int64
+	for id := range s.wlIDs {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+func (s *fakeStore) AllUserIDs(_ context.Context) ([]int64, error) {
+	var ids []int64
+	for id, u := range s.users {
+		if !u.Blocked {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+func (s *fakeStore) CountReferrals(_ context.Context, ref int64) (int, error) {
+	n := 0
+	for _, u := range s.users {
+		if u.ReferredBy == ref {
+			n++
+		}
+	}
+	return n, nil
+}
+func (s *fakeStore) CreateP2PRequest(_ context.Context, r *model.P2PRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reqs == nil {
+		s.reqs = map[int64]*model.P2PRequest{}
+	}
+	if r.ID == 0 {
+		s.seq++
+		r.ID = s.seq
+	}
+	if r.CreatedAt == "" {
+		r.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	cp := *r
+	s.reqs[r.ID] = &cp
+	return nil
+}
+
+// LastAwaitingP2PRequest повторяет запрос хранилища: самая свежая заявка
+// пользователя, которая всё ещё ждёт чек.
+func (s *fakeStore) OpenP2PRequest(_ context.Context, tgID int64) (*model.P2PRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *model.P2PRequest
+	for _, r := range s.reqs {
+		if r.TelegramID != tgID || (r.Status != model.P2PAwaiting && r.Status != model.P2PSubmitted) {
+			continue
+		}
+		if best == nil || r.CreatedAt > best.CreatedAt || (r.CreatedAt == best.CreatedAt && r.ID > best.ID) {
+			best = r
+		}
+	}
+	if best == nil {
+		return nil, nil
+	}
+	cp := *best
+	return &cp, nil
+}
+
+func (s *fakeStore) LastAwaitingP2PRequest(_ context.Context, tgID int64) (*model.P2PRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *model.P2PRequest
+	for _, r := range s.reqs {
+		if r.TelegramID != tgID || r.Status != model.P2PAwaiting {
+			continue
+		}
+		if best == nil || r.CreatedAt > best.CreatedAt || (r.CreatedAt == best.CreatedAt && r.ID > best.ID) {
+			best = r
+		}
+	}
+	if best == nil {
+		return nil, nil
+	}
+	cp := *best
+	return &cp, nil
+}
+
+func (s *fakeStore) GetP2PRequest(_ context.Context, id int64) (*model.P2PRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reqs == nil || s.reqs[id] == nil {
+		return nil, nil
+	}
+	cp := *s.reqs[id]
+	return &cp, nil
+}
+func (s *fakeStore) UpdateP2PRequest(_ context.Context, r *model.P2PRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reqs == nil {
+		s.reqs = map[int64]*model.P2PRequest{}
+	}
+	cp := *r
+	s.reqs[r.ID] = &cp
+	return nil
+}
+func (s *fakeStore) LoadMediaFileID(_ context.Context, section string) (string, bool, error) {
+	if s.media == nil {
+		return "", false, nil
+	}
+	id, ok := s.media[section]
+	return id, ok, nil
+}
+
+func (s *fakeStore) SaveMediaFileID(_ context.Context, section, fileID string) error {
+	if s.media == nil {
+		s.media = map[string]string{}
+	}
+	s.media[section] = fileID
+	return nil
+}
+
+func (s *fakeStore) DeleteMediaFileID(_ context.Context, section string) error {
+	if s.media != nil {
+		delete(s.media, section)
+	}
+	return nil
+}
+
+func (s *fakeStore) AddPendingInvoice(_ context.Context, p *model.PendingInvoice) error {
+	if s.pending == nil {
+		s.pending = map[int64]*model.PendingInvoice{}
+	}
+	if p.ID == 0 {
+		s.seq++
+		p.ID = s.seq
+	}
+	if p.CreatedAt == "" {
+		p.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	cp := *p
+	s.pending[p.ID] = &cp
+	return nil
+}
+func (s *fakeStore) ListUnresolvedPending(_ context.Context, createdBefore string, limit int) ([]model.PendingInvoice, error) {
+	var out []model.PendingInvoice
+	for _, p := range s.pending {
+		if !p.Resolved && p.CreatedAt <= createdBefore {
+			out = append(out, *p)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+func (s *fakeStore) ResolvePending(_ context.Context, id int64) error {
+	if p, ok := s.pending[id]; ok {
+		p.Resolved = true
+	}
+	return nil
+}
+func (s *fakeStore) PendingByExtID(_ context.Context, extID string) (*model.PendingInvoice, error) {
+	if extID == "" {
+		return nil, nil
+	}
+	for _, p := range s.pending {
+		if p.ExtID == extID {
+			cp := *p
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *fakeStore) Export(context.Context) (*storage.Snapshot, error) {
+	return &storage.Snapshot{}, nil
+}
+func (s *fakeStore) Import(context.Context, *storage.Snapshot) error { return nil }
+
+func (s *fakeStore) Kind() string { return "fake" }
+func (s *fakeStore) Close() error { return nil }
+
+func newTestApp(t *testing.T) (*App, *fakeMsg, *fakeStore) {
+	t.Helper()
+	fm := &fakeMsg{}
+	fs := &fakeStore{}
+	a := &App{
+		cfg: &config.Config{AdminID: 100, DataDir: t.TempDir()},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msg: fm,
+		wiz: map[int64]*wizard{},
+	}
+	a.newStore = func(kind, dsn string) (storage.Storage, error) { return fs, nil }
+	a.bootAt = time.Now()
+	return a, fm, fs
+}
+
+func msgText(uid int64, text string) *models.Message {
+	return &models.Message{Text: text, From: &models.User{ID: uid}, Chat: models.Chat{ID: uid}}
+}
+func cb(uid int64, data string) *models.CallbackQuery {
+	return &models.CallbackQuery{ID: "cbid", Data: data, From: models.User{ID: uid}}
+}
+
+func panelStub(users int) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/system/stats") {
+			_, _ = w.Write([]byte(`{"response":{"users":{"totalUsers":` + itoa(users) + `}}}`))
+			return
+		}
+		// Настоящая панель отвечает JSON — стаб не должен быть «добрее» её,
+		// иначе проверка Health «это панель, а не заглушка прокси» не
+		// проверяется ничем.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"response":{"isConnected":true}}`))
+	}))
+}
+func itoa64(n int64) string { return strconv.FormatInt(n, 10) }
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}
+
+func TestWizard_RemoteDocs_HappyPath(t *testing.T) {
+	srv := panelStub(7)
+	defer srv.Close()
+	a, fm, fs := newTestApp(t)
+	ctx := context.Background()
+
+	a.handleMessage(ctx, msgText(100, "/start"))
+	a.handleCallback(ctx, cb(100, "lang:ru"))
+	a.handleCallback(ctx, cb(100, "db:sqlite"))
+	if a.store == nil {
+		t.Fatalf("после выбора SQLite store не открыт; лог:\n%s", fm.joined())
+	}
+	a.handleCallback(ctx, cb(100, "loc:remote"))
+	a.handleCallback(ctx, cb(100, "inst:docs"))
+	a.handleMessage(ctx, msgText(100, srv.URL))
+	a.handleMessage(ctx, msgText(100, "api-token-xyz"))
+	a.handleCallback(ctx, cb(100, "apiprot:no"))
+
+	if !a.installed() {
+		t.Fatalf("бот не установлен в конце; лог:\n%s", fm.joined())
+	}
+	if fs.cfg == nil || fs.cfg.Panel.APIToken != "api-token-xyz" {
+		t.Fatalf("конфиг сохранён неверно: %+v", fs.cfg)
+	}
+	if fs.cfg.Panel.Mode != model.ModeRemote || fs.cfg.Language != "ru" {
+		t.Fatalf("конфиг: mode=%q lang=%q", fs.cfg.Panel.Mode, fs.cfg.Language)
+	}
+	if !strings.Contains(fm.last(), "7") {
+		t.Fatalf("в финальном сообщении нет числа пользователей: %q", fm.last())
+	}
+}
+
+func TestWizard_Local_SkipsInstallAndCookie(t *testing.T) {
+	srv := panelStub(3)
+	defer srv.Close()
+	a, fm, fs := newTestApp(t)
+	ctx := context.Background()
+
+	a.handleMessage(ctx, msgText(100, "/start"))
+	a.handleCallback(ctx, cb(100, "lang:en"))
+	a.handleCallback(ctx, cb(100, "db:sqlite"))
+	a.handleCallback(ctx, cb(100, "loc:local"))
+
+	a.handleMessage(ctx, msgText(100, "tok"))
+
+	w := a.wiz[100]
+	if w == nil {
+		t.Fatalf("состояние мастера пропало; лог:\n%s", fm.joined())
+	}
+	if w.cfg.Panel.Mode != model.ModeLocal || w.cfg.Panel.BaseURL == "" {
+		t.Fatalf("локальный режим не выставлен: %+v", w.cfg.Panel)
+	}
+
+	if a.installed() {
+		t.Fatal("в локальном тесте установка не должна завершиться (панель недостижима)")
+	}
+	_ = fs
+}
+
+func TestWizard_RemoteEGames_AsksCookie(t *testing.T) {
+	a, fm, _ := newTestApp(t)
+	ctx := context.Background()
+
+	a.handleMessage(ctx, msgText(100, "/start"))
+	a.handleCallback(ctx, cb(100, "lang:ru"))
+	a.handleCallback(ctx, cb(100, "db:sqlite"))
+	a.handleCallback(ctx, cb(100, "loc:remote"))
+	a.handleCallback(ctx, cb(100, "inst:egames"))
+	a.handleMessage(ctx, msgText(100, "https://panel.example.com"))
+	a.handleMessage(ctx, msgText(100, "token"))
+
+	if w := a.wiz[100]; w == nil || w.step != stepCookie {
+		t.Fatalf("ожидался шаг ввода куки; лог:\n%s", fm.joined())
+	}
+	if !strings.Contains(fm.last(), "nginx.conf") {
+		t.Fatalf("в подсказке про куку нет nginx.conf: %q", fm.last())
+	}
+}
+
+func TestWizard_PostgresNoDocker_AsksDSN(t *testing.T) {
+	a, fm, _ := newTestApp(t)
+	ctx := context.Background()
+
+	a.handleMessage(ctx, msgText(100, "/start"))
+	a.handleCallback(ctx, cb(100, "lang:ru"))
+	a.handleCallback(ctx, cb(100, "db:postgres"))
+
+	if w := a.wiz[100]; w == nil || w.step != stepPGDSN {
+		t.Fatalf("ожидался запрос DSN PostgreSQL; лог:\n%s", fm.joined())
+	}
+}
+
+func TestNonAdminIgnored(t *testing.T) {
+	a, fm, _ := newTestApp(t)
+	a.handleMessage(context.Background(), msgText(999, "/start"))
+	if _, ok := a.wiz[999]; ok {
+		t.Fatal("мастер не должен стартовать для не-админа")
+	}
+	if !strings.Contains(fm.last(), "админ") && !strings.Contains(strings.ToLower(fm.last()), "admin") {
+		t.Fatalf("ожидался отказ не-админу: %q", fm.last())
+	}
+}
+
+func photoMsg(uid int64, fileID string) *models.Message {
+	return &models.Message{From: &models.User{ID: uid}, Chat: models.Chat{ID: uid}, Photo: []models.PhotoSize{{FileID: fileID}}}
+}
+
+func TestP2P_FullFlow(t *testing.T) {
+
+	created := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/by-telegram-id/") {
+			if created {
+				_, _ = w.Write([]byte(`{"response":{"uuid":"u1","subscriptionUrl":"https://sub/abc"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodPost || r.Method == http.MethodPatch {
+			created = true
+		}
+		_, _ = w.Write([]byte(`{"response":{"uuid":"u1","subscriptionUrl":"https://sub/abc"}}`))
+	}))
+	defer srv.Close()
+
+	fm := &fakeMsg{}
+	fs := &fakeStore{}
+	a := &App{
+		cfg:   &config.Config{AdminID: 100, DataDir: t.TempDir()},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msg:   fm,
+		wiz:   map[int64]*wizard{},
+		ui:    map[int64]*uiState{},
+		store: fs,
+	}
+	a.botCfg = &model.BotConfig{
+		Installed: true, Language: "ru",
+		P2P: model.P2PConfig{Enabled: true, Cards: []string{"CARD-1"}, Prices: map[int]string{1: "100"}, SquadUUID: "sq1"},
+	}
+	a.panel = remnawave.New(model.PanelConfig{Mode: model.ModeRemote, BaseURL: srv.URL, APIToken: "t"})
+	ctx := context.Background()
+	const user int64 = 555
+
+	a.handleCallback(ctx, cb(user, "buy:1"))
+	a.handleCallback(ctx, cb(user, "method:p2p"))
+	if u, _ := fs.GetUser(ctx, user); u != nil && u.P2PApproved {
+		t.Fatal("на этом шаге юзер не должен быть одобрен")
+	}
+
+	a.handleCallback(ctx, cb(100, "adm:uok:555"))
+	if u, _ := fs.GetUser(ctx, user); u == nil || !u.P2PApproved {
+		t.Fatal("админ должен был одобрить доступ")
+	}
+
+	a.handleCallback(ctx, cb(user, "buy:1"))
+	a.handleCallback(ctx, cb(user, "method:p2p"))
+	if !strings.Contains(fm.joined(), "CARD-1") {
+		t.Fatalf("карта не выдана:\n%s", fm.joined())
+	}
+	var reqID int64
+	for id := range fs.reqs {
+		if id > reqID {
+			reqID = id
+		}
+	}
+	if reqID == 0 {
+		t.Fatal("заявка не создана")
+	}
+
+	a.handleCallback(ctx, cb(user, "p2p:paid:"+strconv.FormatInt(reqID, 10)))
+	a.handlePhoto(ctx, photoMsg(user, "file_123"))
+	if r, _ := fs.GetP2PRequest(ctx, reqID); r == nil || r.Status != model.P2PSubmitted || r.Screenshot != "file_123" {
+		t.Fatalf("скриншот не сохранён: %+v", r)
+	}
+
+	a.handleCallback(ctx, cb(100, "adm:pok:"+strconv.FormatInt(reqID, 10)))
+	if r, _ := fs.GetP2PRequest(ctx, reqID); r == nil || r.Status != model.P2PApproved {
+		t.Fatalf("оплата не подтверждена: %+v", r)
+	}
+	if !strings.Contains(fm.joined(), "sub/abc") {
+		t.Fatalf("юзеру не отправлена ссылка:\n%s", fm.joined())
+	}
+}
+
+func TestUsersAdmin_BlockEnforceDelete(t *testing.T) {
+	fm := &fakeMsg{}
+	fs := &fakeStore{}
+	a := &App{
+		cfg:   &config.Config{AdminID: 100, DataDir: t.TempDir()},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msg:   fm,
+		wiz:   map[int64]*wizard{},
+		ui:    map[int64]*uiState{},
+		store: fs,
+	}
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru"}
+	ctx := context.Background()
+	const user int64 = 555
+
+	_ = fs.UpsertUser(ctx, user)
+
+	a.handleCallback(ctx, cb(100, "usr:blockbot:555"))
+	if u, _ := fs.GetUser(ctx, user); u == nil || !u.Blocked {
+		t.Fatalf("юзер должен быть заблокирован: %+v", u)
+	}
+
+	fm.texts = nil
+	a.handleMessage(ctx, msgText(user, "/start"))
+	if !strings.Contains(fm.joined(), "ограничен") {
+		t.Fatalf("заблокированному должен прийти отказ, got:\n%s", fm.joined())
+	}
+
+	fm.texts = nil
+	a.handleCallback(ctx, cb(user, "menu:buy"))
+	if !strings.Contains(fm.joined(), "ограничен") {
+		t.Fatalf("callback заблокированного должен быть отклонён, got:\n%s", fm.joined())
+	}
+
+	a.handleCallback(ctx, cb(100, "usr:unblockbot:555"))
+	if u, _ := fs.GetUser(ctx, user); u == nil || u.Blocked {
+		t.Fatalf("юзер должен быть разблокирован: %+v", u)
+	}
+
+	a.handleCallback(ctx, cb(100, "usr:delbot:555"))
+	if u, _ := fs.GetUser(ctx, user); u != nil {
+		t.Fatal("после удаления записи быть не должно")
+	}
+}
+
+func TestUsersAdmin_DeleteDisablesInPanel(t *testing.T) {
+	var blockHits, deleteHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/users/by-telegram-id/"):
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"response":[{"uuid":"u-555","tag":"CHILLBOT","username":"tg_555","subscriptionUrl":"https://x/sub/y"}]}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/users/"):
+			deleteHits++
+			w.WriteHeader(http.StatusOK)
+		default:
+			blockHits++
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	fm := &fakeMsg{}
+	fs := &fakeStore{}
+	a := &App{
+		cfg:   &config.Config{AdminID: 100, DataDir: t.TempDir()},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msg:   fm,
+		wiz:   map[int64]*wizard{},
+		ui:    map[int64]*uiState{},
+		store: fs,
+	}
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru"}
+	a.panel = remnawave.New(model.PanelConfig{Mode: model.ModeRemote, BaseURL: srv.URL, APIToken: "t"})
+	ctx := context.Background()
+
+	_ = fs.UpsertUser(ctx, 555)
+
+	a.handleCallback(ctx, cb(100, "usr:blockbot:555"))
+	if blockHits != 0 {
+		t.Fatalf("блокировка не должна обращаться к панели, hits=%d", blockHits)
+	}
+
+	a.handleCallback(ctx, cb(100, "usr:delfull:555"))
+	if deleteHits != 1 {
+		t.Fatalf("delfull должен дёрнуть DELETE /api/users ровно 1 раз, hits=%d", deleteHits)
+	}
+
+	if u, _ := fs.GetUser(ctx, 555); u != nil {
+		t.Fatal("после удаления users не должно остаться")
+	}
+}
+
+func TestSingleMessageUI(t *testing.T) {
+	srv := panelStub(5)
+	defer srv.Close()
+	a, fm, _ := newTestApp(t)
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru"}
+	ctx := context.Background()
+
+	a.handleMessage(ctx, msgText(100, "/start"))
+	afterStart := fm.liveCount()
+	if afterStart == 0 {
+		t.Fatalf("после /start должно быть видимое сообщение, live=%d", afterStart)
+	}
+
+	a.handleCallback(ctx, cb(100, "menu:manage"))
+
+	a.handleCallback(ctx, cb(100, "menu:home"))
+	if got := fm.liveCount(); got != afterStart {
+		t.Fatalf("на экране должно оставаться только текущее (%d), а живых=%d; deleted=%v", afterStart, got, fm.deleted)
+	}
+	if len(fm.deleted) == 0 {
+		t.Fatal("предыдущие экраны должны были удаляться")
+	}
+}
+
+func TestNotificationsArePersistent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	fm := &fakeMsg{}
+	fs := &fakeStore{}
+	a := &App{
+		cfg:   &config.Config{AdminID: 100, DataDir: t.TempDir()},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msg:   fm,
+		wiz:   map[int64]*wizard{},
+		ui:    map[int64]*uiState{},
+		store: fs,
+	}
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru", P2P: model.P2PConfig{Enabled: true, Prices: map[int]string{1: "100"}}}
+	ctx := context.Background()
+	const user int64 = 555
+
+	a.handleCallback(ctx, cb(user, "buy:1"))
+	a.handleCallback(ctx, cb(user, "method:p2p"))
+	if !strings.Contains(fm.joined(), "просит доступ") {
+		t.Fatalf("админу не пришло уведомление о запросе:\n%s", fm.joined())
+	}
+	notifDeleted := len(fm.deleted)
+
+	a.handleCallback(ctx, cb(user, "buy:1"))
+	a.handleCallback(ctx, cb(user, "buy:1"))
+	if len(fm.deleted) > notifDeleted {
+
+	}
+
+	foundLive := false
+	fm.mu.Lock()
+	for _, txt := range fm.live {
+		if strings.Contains(txt, "просит доступ") {
+			foundLive = true
+		}
+	}
+	fm.mu.Unlock()
+	if !foundLive {
+		t.Fatal("уведомление админу не должно удаляться при навигации пользователя")
+	}
+}
+
+func TestUserLabel(t *testing.T) {
+	cases := []struct {
+		u    model.User
+		want string
+	}{
+		{model.User{TelegramID: 1000000001, Username: "vasya"}, "@vasya (1000000001)"},
+		{model.User{TelegramID: 7, FirstName: "Вася"}, "Вася (7)"},
+		{model.User{TelegramID: 42}, "42"},
+	}
+	for _, c := range cases {
+		if got := userLabel(&c.u); got != c.want {
+			t.Fatalf("userLabel(%+v)=%q want %q", c.u, got, c.want)
+		}
+	}
+}
+
+func btnData(rows []models.InlineKeyboardButton) string {
+	var b strings.Builder
+	for _, x := range rows {
+		b.WriteString(x.CallbackData + "|")
+	}
+	return b.String()
+}
+
+func TestNavRow(t *testing.T) {
+	a, _, fs := newTestApp(t)
+	a.store = fs
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru"}
+	ctx := context.Background()
+	const user int64 = 555
+
+	hasSub := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/by-telegram-id/") {
+			if hasSub {
+				_, _ = w.Write([]byte(`{"response":{"uuid":"u1","subscriptionUrl":"https://sub/abc"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	a.panel = remnawave.New(model.PanelConfig{Mode: model.ModeRemote, BaseURL: srv.URL, APIToken: "t"})
+
+	if row := a.navRow(ctx, user); btnData(row) != "menu:buy|menu:balance|" {
+		t.Fatalf("юзер без подписки (без Главной в строке действий): %s", btnData(row))
+	}
+
+	hasSub = true
+	a.invalidateSubCache(user)
+	if row := a.navRow(ctx, user); btnData(row) != "menu:mysubs|menu:balance|" {
+		t.Fatalf("юзер с подпиской: %s", btnData(row))
+	}
+}
+
+func TestUserCard_AllowP2P(t *testing.T) {
+	a, fm, fs := newTestApp(t)
+	a.store = fs
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru"}
+	ctx := context.Background()
+	const user int64 = 555
+	_ = fs.UpsertUser(ctx, user)
+
+	a.handleCallback(ctx, cb(100, "usr:p2pon:555"))
+	if u, _ := fs.GetUser(ctx, user); u == nil || !u.P2PApproved {
+		t.Fatalf("P2P-доступ должен быть выдан: %+v", u)
+	}
+	if !strings.Contains(fm.joined(), "оплат") || !strings.Contains(fm.joined(), "перевод") {
+		t.Fatalf("пользователь должен получить уведомление об открытом P2P:\n%s", fm.joined())
+	}
+
+	a.handleCallback(ctx, cb(100, "usr:p2poff:555"))
+	if u, _ := fs.GetUser(ctx, user); u == nil || u.P2PApproved {
+		t.Fatalf("P2P-доступ должен быть снят: %+v", u)
+	}
+}
+
+func successPayMsg(uid int64, payload string, amount int) *models.Message {
+	return &models.Message{
+		From: &models.User{ID: uid}, Chat: models.Chat{ID: uid},
+		SuccessfulPayment: &models.SuccessfulPayment{Currency: "XTR", TotalAmount: amount, InvoicePayload: payload},
+	}
+}
+func cbMsg(uid int64, data string, msgID int) *models.CallbackQuery {
+	return &models.CallbackQuery{ID: "cbid", Data: data, From: models.User{ID: uid},
+		Message: models.MaybeInaccessibleMessage{Message: &models.Message{ID: msgID}}}
+}
+
+func TestStarsFlow(t *testing.T) {
+
+	created := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/by-telegram-id/") {
+			if created {
+				_, _ = w.Write([]byte(`{"response":{"uuid":"u1","subscriptionUrl":"https://sub/abc"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodPost || r.Method == http.MethodPatch {
+			created = true
+		}
+		_, _ = w.Write([]byte(`{"response":{"uuid":"u1","subscriptionUrl":"https://sub/abc"}}`))
+	}))
+	defer srv.Close()
+
+	fm := &fakeMsg{}
+	fs := &fakeStore{}
+	a := &App{
+		cfg: &config.Config{AdminID: 100, DataDir: t.TempDir()},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msg: fm, wiz: map[int64]*wizard{}, ui: map[int64]*uiState{}, store: fs,
+	}
+	a.botCfg = &model.BotConfig{
+		Installed: true, Language: "ru",
+		Stars: model.StarsConfig{Enabled: true, Prices: map[int]int{1: 100}},
+		// Базовая цена — признак того, что срок в продаже: без неё его нет ни
+		// в витрине, ни в мини-аппе, и звёздами он тоже не продаётся.
+		Pricing: model.Pricing{Base: map[int]string{1: "150"}},
+	}
+	a.panel = remnawave.New(model.PanelConfig{Mode: model.ModeRemote, BaseURL: srv.URL, APIToken: "t"})
+	ctx := context.Background()
+	const user int64 = 555
+
+	a.handleCallback(ctx, cb(user, "buy:1"))
+	a.handleCallback(ctx, cb(user, "method:stars"))
+	if len(fm.invoices) != 1 || fm.invoices[0] != "XTR:100:stars:1" {
+		t.Fatalf("инвойс не выставлен корректно: %v", fm.invoices)
+	}
+
+	a.handlePreCheckout(ctx, &models.PreCheckoutQuery{ID: "pc1", InvoicePayload: "stars:1"})
+
+	a.handleSuccessfulPayment(ctx, successPayMsg(user, "stars:1", 100))
+
+	if !strings.Contains(fm.joined(), "sub/abc") {
+		t.Fatalf("после оплаты не пришла ссылка:\n%s", fm.joined())
+	}
+	if ok, _ := fs.HasPaidPayment(ctx, user); !ok {
+		t.Fatal("оплата не записана в лог")
+	}
+
+	if row := a.navRow(ctx, user); btnData(row) != "menu:mysubs|menu:balance|" {
+		t.Fatalf("после Stars-оплаты ожидались Мои подписки: %s", btnData(row))
+	}
+}
+
+func TestModerationNotificationDeleted(t *testing.T) {
+	a, fm, fs := newTestApp(t)
+	a.store = fs
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru", P2P: model.P2PConfig{Enabled: true, Prices: map[int]string{1: "100"}}}
+	ctx := context.Background()
+
+	const notifID = 777
+	a.handleCallback(ctx, cbMsg(100, "adm:uok:555", notifID))
+	found := false
+	for _, id := range fm.deleted {
+		if id == notifID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("уведомление (msgID=%d) должно быть удалено; deleted=%v", notifID, fm.deleted)
+	}
+	if u, _ := fs.GetUser(ctx, 555); u == nil || !u.P2PApproved {
+		t.Fatal("доступ должен быть выдан")
+	}
+}
+
+func TestPricingResolver(t *testing.T) {
+	pr := model.Pricing{
+		Currency: "руб",
+		Base:     map[int]string{1: "150", 3: "400"},
+		P2P:      map[int]string{1: "140"},
+		YooKassa: map[int]string{},
+		Stars:    map[int]int{1: 100},
+	}
+	if got := pr.Fiat(model.PayMethodP2P, 1); got != "140" {
+		t.Fatalf("P2P override 1мес = %q, want 140", got)
+	}
+	if got := pr.Fiat(model.PayMethodP2P, 3); got != "400" {
+		t.Fatalf("P2P fallback to base 3мес = %q, want 400", got)
+	}
+	if got := pr.Fiat(model.PayMethodYooKassa, 1); got != "150" {
+		t.Fatalf("YK fallback to base 1мес = %q, want 150", got)
+	}
+	if got := pr.StarPrice(1); got != 100 {
+		t.Fatalf("stars 1мес = %d, want 100", got)
+	}
+}
+
+func TestYooKassaFlow(t *testing.T) {
+
+	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/by-telegram-id/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"response":{"uuid":"u1","subscriptionUrl":"https://sub/yk"}}`))
+	}))
+	defer panel.Close()
+
+	yk := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_, _ = w.Write([]byte(`{"id":"pay_42","status":"pending","confirmation":{"confirmation_url":"https://yoo/p/42"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"pay_42","status":"succeeded","paid":true,"amount":{"value":"150.00","currency":"RUB"},"metadata":{"months":"1","telegram_id":"555"}}`))
+	}))
+	defer yk.Close()
+	oldBase := yookassa.BaseURL
+	yookassa.BaseURL = yk.URL
+	defer func() { yookassa.BaseURL = oldBase }()
+
+	fm := &fakeMsg{}
+	fs := &fakeStore{}
+	a := &App{
+		cfg: &config.Config{AdminID: 100, DataDir: t.TempDir()},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msg: fm, wiz: map[int64]*wizard{}, ui: map[int64]*uiState{}, store: fs,
+	}
+	a.botCfg = &model.BotConfig{
+		Installed: true, Language: "ru",
+		YooKassa: model.YooKassaConfig{Enabled: true, ShopID: "shop", SecretKey: "sec", ReturnURL: "https://t.me"},
+		Pricing:  model.Pricing{Currency: "руб", Base: map[int]string{1: "150"}},
+	}
+	a.panel = remnawave.New(model.PanelConfig{Mode: model.ModeRemote, BaseURL: panel.URL, APIToken: "t"})
+	ctx := context.Background()
+	const user int64 = 555
+
+	a.handleCallback(ctx, cb(user, "buy:1"))
+	a.handleCallback(ctx, cb(user, "method:yk"))
+	if !strings.Contains(fm.joined(), "Оплат") {
+		t.Fatalf("не показан запрос на оплату:\n%s", fm.joined())
+	}
+
+	a.handleCallback(ctx, cb(user, "ykc:pay_42"))
+	if !strings.Contains(fm.joined(), "sub/yk") {
+		t.Fatalf("после успешной оплаты нет ссылки:\n%s", fm.joined())
+	}
+	if ok, _ := fs.HasPaidPayment(ctx, user); !ok {
+		t.Fatal("оплата ЮKassa не записана в лог")
+	}
+
+	before := len(fs.pays)
+	a.handleCallback(ctx, cb(user, "ykc:pay_42"))
+	if len(fs.pays) != before {
+		t.Fatalf("повторная проверка не должна создавать новый платёж: было %d стало %d", before, len(fs.pays))
+	}
+}
+
+func TestHomeReplyButton(t *testing.T) {
+	a, fm, fs := newTestApp(t)
+	a.store = fs
+	a.botCfg = &model.BotConfig{Installed: true, Language: "ru"}
+	ctx := context.Background()
+
+	a.handleMessage(ctx, msgText(100, "🏠 Главная"))
+	if fm.joined() == "" {
+		t.Fatal("по кнопке «Главная» бот ничего не показал")
+	}
+
+	if len(fm.deleted) == 0 {
+		t.Fatal("сообщение-нажатие «Главная» должно удаляться")
+	}
+}
+
+func TestReconciler_ResolvesAlreadyPaid(t *testing.T) {
+	ctx := context.Background()
+	fs := &fakeStore{}
+
+	_ = fs.AddPayment(ctx, &model.Payment{TelegramID: 777, Method: model.PayMethodYooKassa, ExtID: "yk_x", Status: model.PaymentPaid})
+	_ = fs.AddPendingInvoice(ctx, &model.PendingInvoice{
+		Method: model.PayMethodYooKassa, ExtID: "yk_x", TelegramID: 777, Months: 1,
+		CreatedAt: time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339),
+	})
+	a := &App{store: fs, log: slog.Default()}
+	a.reconcileOnce(ctx)
+	left, _ := fs.ListUnresolvedPending(ctx, time.Now().UTC().Format(time.RFC3339), 50)
+	if len(left) != 0 {
+		t.Fatalf("ожидалось, что pending закроется как уже-оплаченный, осталось: %d", len(left))
+	}
+}
+
+func TestReconciler_GivesUpStale(t *testing.T) {
+	ctx := context.Background()
+	fs := &fakeStore{}
+	_ = fs.AddPendingInvoice(ctx, &model.PendingInvoice{
+		Method: model.PayMethodYooKassa, ExtID: "yk_old", TelegramID: 777, Months: 1,
+		CreatedAt: time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339),
+	})
+	a := &App{store: fs, log: slog.Default()}
+	a.reconcileOnce(ctx)
+	left, _ := fs.ListUnresolvedPending(ctx, time.Now().UTC().Format(time.RFC3339), 50)
+	if len(left) != 0 {
+		t.Fatalf("протухший инвойс должен сняться с учёта, осталось: %d", len(left))
+	}
+}
+
+func TestReconciler_SkipsFresh(t *testing.T) {
+	ctx := context.Background()
+	fs := &fakeStore{}
+	_ = fs.AddPendingInvoice(ctx, &model.PendingInvoice{
+		Method: model.PayMethodYooKassa, ExtID: "yk_fresh", TelegramID: 777, Months: 1,
+	})
+	a := &App{store: fs, log: slog.Default()}
+	a.reconcileOnce(ctx)
+
+	left, _ := fs.ListUnresolvedPending(ctx, time.Now().UTC().Format(time.RFC3339), 50)
+	if len(left) != 1 {
+		t.Fatalf("свежий инвойс не должен трогаться реконсилятором, осталось: %d", len(left))
+	}
+}
+
+func p2pDocMsg(uid int64, fileID, name, mime string) *models.Message {
+	return &models.Message{
+		From:     &models.User{ID: uid},
+		Chat:     models.Chat{ID: uid},
+		Document: &models.Document{FileID: fileID, FileName: name, MimeType: mime},
+	}
+}
+
+// Пользователь часто присылает чек не скриншотом, а файлом: PDF из банковского
+// приложения или ту же картинку «без сжатия». Раньше такое сообщение молча
+// терялось — заявка висела, а админ ничего не получал.
+func TestP2P_ReceiptAsDocument(t *testing.T) {
+	newApp := func() (*App, *fakeMsg, *fakeStore) {
+		fm := &fakeMsg{}
+		fs := &fakeStore{}
+		a := &App{
+			cfg:   &config.Config{AdminID: 100, DataDir: t.TempDir()},
+			log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+			msg:   fm,
+			wiz:   map[int64]*wizard{},
+			ui:    map[int64]*uiState{},
+			store: fs,
+		}
+		a.botCfg = &model.BotConfig{Installed: true, Language: "ru",
+			P2P: model.P2PConfig{Enabled: true, Cards: []string{"CARD-1"}, Prices: map[int]string{1: "100"}}}
+		return a, fm, fs
+	}
+
+	cases := []struct {
+		name, file, mime string
+	}{
+		{"pdf по mime", "check.pdf", "application/pdf"},
+		{"pdf по расширению", "check.PDF", ""},
+		{"картинка файлом", "IMG_0001.jpg", "image/jpeg"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, fm, fs := newApp()
+			ctx := context.Background()
+			const user int64 = 555
+			req := &model.P2PRequest{TelegramID: user, Months: 1, Price: "100", Status: model.P2PAwaiting}
+			if err := fs.CreateP2PRequest(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			a.handleCallback(ctx, cb(user, "p2p:paid:"+strconv.FormatInt(req.ID, 10)))
+			a.handleDocument(ctx, p2pDocMsg(user, "doc_777", tc.file, tc.mime))
+
+			r, _ := fs.GetP2PRequest(ctx, req.ID)
+			if r == nil || r.Status != model.P2PSubmitted || r.Screenshot != "doc_777" {
+				t.Fatalf("чек не принят: %+v", r)
+			}
+			// Админу такой чек уходит документом: file_id документа Telegram
+			// в sendPhoto не принимает.
+			if len(fm.sentDocIDs) != 1 || fm.sentDocIDs[0] != "doc_777" {
+				t.Fatalf("чек не ушёл админу документом: %v\n%s", fm.sentDocIDs, fm.joined())
+			}
+			if !strings.Contains(fm.joined(), i18n.T("ru", "p2p.submitted")) {
+				t.Fatalf("пользователю не подтвердили приём:\n%s", fm.joined())
+			}
+		})
+	}
+
+	t.Run("посторонний файл", func(t *testing.T) {
+		a, fm, fs := newApp()
+		ctx := context.Background()
+		const user int64 = 555
+		req := &model.P2PRequest{TelegramID: user, Months: 1, Price: "100", Status: model.P2PAwaiting}
+		if err := fs.CreateP2PRequest(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		a.handleCallback(ctx, cb(user, "p2p:paid:"+strconv.FormatInt(req.ID, 10)))
+		a.handleDocument(ctx, p2pDocMsg(user, "doc_bad", "report.xlsx",
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+
+		r, _ := fs.GetP2PRequest(ctx, req.ID)
+		if r == nil || r.Status != model.P2PAwaiting {
+			t.Fatalf("заявка не должна была уйти на проверку: %+v", r)
+		}
+		if len(fm.sentDocIDs) != 0 {
+			t.Fatalf("админу ушёл посторонний файл: %v", fm.sentDocIDs)
+		}
+		if !strings.Contains(fm.joined(), i18n.T("ru", "p2p.bad_receipt")) {
+			t.Fatalf("пользователю не объяснили, что нужен другой файл:\n%s", fm.joined())
+		}
+		// Ожидание чека сохраняется — можно сразу прислать правильный файл.
+		a.handleDocument(ctx, p2pDocMsg(user, "doc_ok", "check.pdf", "application/pdf"))
+		if r, _ := fs.GetP2PRequest(ctx, req.ID); r == nil || r.Status != model.P2PSubmitted {
+			t.Fatalf("повторная отправка чека не сработала: %+v", r)
+		}
+	})
+}
+
+// Ожидание чека живёт в памяти: перезапуск бота между «✅ Я оплатил» и
+// присланным чеком раньше съедал чек молча. Подхватываем последнюю заявку,
+// которая всё ещё ждёт оплату, — но только свежую.
+func TestP2P_ReceiptAfterRestart(t *testing.T) {
+	newApp := func() (*App, *fakeMsg, *fakeStore) {
+		fm := &fakeMsg{}
+		fs := &fakeStore{}
+		a := &App{
+			cfg:   &config.Config{AdminID: 100, DataDir: t.TempDir()},
+			log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+			msg:   fm,
+			wiz:   map[int64]*wizard{},
+			ui:    map[int64]*uiState{},
+			store: fs,
+		}
+		a.botCfg = &model.BotConfig{Installed: true, Language: "ru"}
+		return a, fm, fs
+	}
+	const user int64 = 555
+
+	t.Run("свежая заявка", func(t *testing.T) {
+		a, fm, fs := newApp()
+		ctx := context.Background()
+		req := &model.P2PRequest{TelegramID: user, Months: 1, Price: "100", Status: model.P2PAwaiting,
+			CreatedAt: time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)}
+		if err := fs.CreateP2PRequest(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		// Кнопку «Я оплатил» не нажимаем — имитируем потерянное состояние.
+		a.handleDocument(ctx, p2pDocMsg(user, "doc_after_restart", "check.pdf", "application/pdf"))
+		if r, _ := fs.GetP2PRequest(ctx, req.ID); r == nil || r.Status != model.P2PSubmitted || r.Screenshot != "doc_after_restart" {
+			t.Fatalf("чек после перезапуска не принят: %+v\n%s", r, fm.joined())
+		}
+		// Фотографией — тот же путь.
+		a2, _, fs2 := newApp()
+		req2 := &model.P2PRequest{TelegramID: user, Months: 1, Price: "100", Status: model.P2PAwaiting,
+			CreatedAt: time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)}
+		if err := fs2.CreateP2PRequest(ctx, req2); err != nil {
+			t.Fatal(err)
+		}
+		a2.handlePhoto(ctx, photoMsg(user, "file_after_restart"))
+		if r, _ := fs2.GetP2PRequest(ctx, req2.ID); r == nil || r.Status != model.P2PSubmitted {
+			t.Fatalf("скриншот после перезапуска не принят: %+v", r)
+		}
+	})
+
+	t.Run("протухшая заявка", func(t *testing.T) {
+		a, fm, fs := newApp()
+		ctx := context.Background()
+		req := &model.P2PRequest{TelegramID: user, Months: 1, Price: "100", Status: model.P2PAwaiting,
+			CreatedAt: time.Now().UTC().Add(-30 * time.Hour).Format(time.RFC3339)}
+		if err := fs.CreateP2PRequest(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		a.handlePhoto(ctx, photoMsg(user, "random_photo"))
+		if r, _ := fs.GetP2PRequest(ctx, req.ID); r == nil || r.Status != model.P2PAwaiting {
+			t.Fatalf("случайное фото не должно закрывать старую заявку: %+v", r)
+		}
+		if len(fm.texts) != 0 {
+			t.Fatalf("бот не должен был ничего отправлять:\n%s", fm.joined())
+		}
+	})
+}

@@ -1,0 +1,198 @@
+package web
+
+import (
+	"net/http"
+	"strings"
+	"time"
+)
+
+// Общая обёртка вокруг всего маршрутизатора.
+//
+// Раньше всё «поперечное» — заголовки безопасности, требование HTTPS,
+// ограничение частоты — вызывалось руками внутри отдельных обработчиков, и
+// покрытие вышло дырявым: заголовки стояли на шести маршрутах из тридцати
+// двух, HTTPS на пяти, лимитер на трёх. Причём именно те ручки, которые носят
+// ключ доступа, ссылку на подписку и чек об оплате, были не закрыты ничем.
+//
+// Теперь это одна цепочка на весь маршрутизатор, а исключения перечислены
+// явно и в одном месте.
+
+// noHTTPSPaths — куда требование HTTPS не применяется.
+//
+// Вебхуки платёжек ходят внутрь сети и на 426 уйдут в суточные повторы;
+// healthz дёргает docker изнутри контейнера.
+func noHTTPSPaths(path string) bool {
+	return strings.HasPrefix(path, "/webhook/") || path == "/healthz"
+}
+
+// framable — страницы, которые Telegram намеренно показывает во фрейме.
+// Кабинет фреймить нельзя, мини-апп — нужно.
+func framable(path string) bool {
+	return strings.HasPrefix(path, "/miniapp/") || strings.HasPrefix(path, "/api/miniapp/")
+}
+
+// rlBucket — какой лимит применить к маршруту. Пустая строка — без лимита.
+func rlBucket(r *http.Request) string {
+	p := r.URL.Path
+	switch {
+	case strings.HasPrefix(p, "/webhook/"), p == "/healthz", p == "/robots.txt":
+		// Вебхуки лимитировать нельзя категорически: на 429 провайдеры уходят
+		// в суточные повторы, а healthz дёргает оркестратор.
+		return ""
+	case strings.HasPrefix(p, "/api/cabinet/auth/"), p == "/api/miniapp/auth",
+		strings.HasPrefix(p, "/api/cabinet/password/"),
+		strings.HasPrefix(p, "/api/cabinet/email/"),
+		strings.HasPrefix(p, "/api/cabinet/tg/"):
+		// Вход и обмен подписи: подбор пароля и бесплатный расход процессора
+		// на проверке подписи. Здесь же ссылки из писем и смена пароля: перебор
+		// значения ссылки, подбор старого пароля и — отдельной статьёй — чужой
+		// почтовый сервер, с которого нас попросят, если превратить отправку в
+		// бесплатную рассылку.
+		return "auth"
+	case p == "/api/miniapp/promo",
+		p == "/api/miniapp/checkout",
+		p == "/api/miniapp/topup",
+		p == "/api/miniapp/trial",
+		p == "/api/cabinet/p2p/screenshot",
+		p == "/api/miniapp/devices/reset":
+		// Деньги и дорогие действия: перебор промокодов — это прямой убыток,
+		// чек весит до двенадцати мегабайт, а сброс устройств бьёт по панели.
+		return "money"
+	case strings.HasPrefix(p, "/api/"):
+		return "read"
+	}
+	return ""
+}
+
+// wrap навешивает на маршрутизатор заголовки, требование HTTPS и лимитер.
+func (s *Server) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secure := isSecure(r)
+		path := r.URL.Path
+
+		// Заголовки ставятся всем и до записи тела. Единственная развилка —
+		// запрет фрейма: мини-апп обязан открываться внутри Telegram.
+		if !strings.HasPrefix(path, "/webhook/") {
+			s.setSecurityHeaders(w, !framable(path), secure)
+		}
+
+		if !secure && !noHTTPSPaths(path) && !s.allowPlainHTTP {
+			if r.Method == http.MethodGet && !strings.HasPrefix(path, "/api/") {
+				if to := s.httpsTarget(r); to != "" {
+					// #nosec G710 -- адрес собран httpsTarget: хост из настройки домена либо из Host, пропущенного через safeHost, путь и запрос — из разобранного URL
+					http.Redirect(w, r, to, http.StatusPermanentRedirect)
+					return
+				}
+			}
+			writeJSON(w, http.StatusUpgradeRequired, map[string]string{"error": "требуется HTTPS"})
+			return
+		}
+
+		if b := rlBucket(r); b != "" {
+			if lim := s.limiterFor(b); lim != nil && !lim.allow(b+"|"+clientIP(r)) {
+				w.Header().Set("Retry-After", "60")
+				writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "слишком часто, попробуйте позже"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// httpsTarget собирает адрес, на который переводим с открытого HTTP. Пустая
+// строка — переводить некуда, вызывающий отвечает 426.
+//
+// Хост берётся из настроенного домена, и только если его нет — из заголовка
+// Host, да и то после проверки, что это действительно имя хоста. Заголовок
+// присылает клиент: подставленный в Location как есть, он превращает нашу
+// ссылку в переход на чужой сайт нашими руками. Путь и запрос берутся
+// разобранными, а не строкой запроса целиком: в абсолютной форме запроса
+// («GET http://…») там лежит чужой адрес вместе со схемой.
+func (s *Server) httpsTarget(r *http.Request) string {
+	host := strings.TrimSpace(s.domain)
+	if host == "" {
+		host = safeHost(r.Host)
+	}
+	if host == "" {
+		return ""
+	}
+	path := r.URL.EscapedPath()
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	out := "https://" + host + path
+	if r.URL.RawQuery != "" {
+		out += "?" + r.URL.RawQuery
+	}
+	return out
+}
+
+// safeHost пропускает только имя хоста с необязательным портом: буквы, цифры,
+// точки и дефисы (или адрес IPv6 в квадратных скобках). Всё остальное —
+// косые, собака, пробелы, переводы строк — пустая строка.
+func safeHost(h string) string {
+	h = strings.TrimSpace(h)
+	if h == "" || len(h) > 253 {
+		return ""
+	}
+	name, port := h, ""
+	if strings.HasPrefix(h, "[") {
+		end := strings.LastIndex(h, "]")
+		if end < 0 {
+			return ""
+		}
+		name, port = h[1:end], strings.TrimPrefix(h[end+1:], ":")
+		for _, c := range name {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F' || c == ':' || c == '.') {
+				return ""
+			}
+		}
+	} else {
+		if i := strings.LastIndex(h, ":"); i >= 0 {
+			name, port = h[:i], h[i+1:]
+		}
+		if name == "" {
+			return ""
+		}
+		for _, c := range name {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '.' || c == '-') {
+				return ""
+			}
+		}
+	}
+	for _, c := range port {
+		if c < '0' || c > '9' {
+			return ""
+		}
+	}
+	return h
+}
+
+// limiterFor выдаёт лимитер по имени корзины.
+func (s *Server) limiterFor(bucket string) *rateLimiter {
+	switch bucket {
+	case "auth":
+		return s.authLimiter
+	case "money":
+		return s.moneyLimiter
+	case "read":
+		return s.readLimiter
+	}
+	return nil
+}
+
+// Пороги корзин.
+//
+// read обязан пережить обычную загрузку страницы: мини-апп на старте залпом
+// тянет полдюжины ручек, и слишком тесный лимит ловил бы 429 на честной
+// перезагрузке.
+const (
+	authLimitHits   = 15
+	authLimitWindow = 5 * time.Minute
+
+	moneyLimitHits   = 10
+	moneyLimitWindow = time.Minute
+
+	readLimitHits   = 120
+	readLimitWindow = time.Minute
+)
