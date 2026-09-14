@@ -91,8 +91,9 @@ func (a *App) showCsqttUser(ctx context.Context, chatID int64) {
 }
 
 // issueCsqttAccess — сердце автовыдачи: имя tg_<id> → переиспользовать живой
-// доступ → иначе скопировать vk_hashes/порты из клиента-шаблона → создать →
-// собрать ссылку → отдать пароль + ссылку в чат.
+// доступ → иначе скопировать порты из клиента-шаблона → создать с ПУСТЫМИ
+// VK-хешами (их пользователь вводит сам в клиентском приложении) → собрать
+// ссылку без хешей → отдать пароль + ссылку в чат.
 func (a *App) issueCsqttAccess(ctx context.Context, chatID int64) {
 	lang := a.lang(chatID)
 	cfg := a.csqttCfg()
@@ -160,12 +161,15 @@ func (a *App) issueCsqttAccess(ctx context.Context, chatID int64) {
 		if peer == 0 {
 			peer = 46000
 		}
-		link := csqtt.BuildLink(host, own.Password, peer, own.VKHashes)
+		// Ссылка всегда без хешей: их пользователь вводит сам в приложении.
+		link := csqtt.BuildLink(host, own.Password, peer, "")
 		a.sendCsqttReady(cctx, chatID, own.Password, link, own.Expires, true)
 		return
 	}
 
-	// 2. Клиент-шаблон: копируем режим (vk_hashes + порты).
+	// 2. Клиент-шаблон: копируем только порты. VK-хеши НЕ копируем и НЕ
+	// подставляем: пользователь вводит их сам в клиентском приложении,
+	// доступы создаются с пустым полем.
 	var tpl *csqtt.ClientInfo
 	tplName := strings.TrimSpace(cfg.TemplateName)
 	if tplName != "" {
@@ -184,15 +188,8 @@ func (a *App) issueCsqttAccess(ctx context.Context, chatID int64) {
 			return
 		}
 	} else {
-		// Шаблон не задан — берём первый клиент с хешами как образец режима.
-		for i := range list {
-			if strings.TrimSpace(list[i].VKHashes) != "" {
-				cp := list[i]
-				tpl = &cp
-				break
-			}
-		}
-		if tpl == nil && len(list) > 0 {
+		// Шаблон не задан — берём первый клиент как образец портов.
+		if len(list) > 0 {
 			cp := list[0]
 			tpl = &cp
 		}
@@ -200,7 +197,6 @@ func (a *App) issueCsqttAccess(ctx context.Context, chatID int64) {
 
 	hash, dtls, wg, local := "", 46000, 46001, 0
 	if tpl != nil {
-		hash = tpl.VKHashes
 		if tpl.DTLSPort != 0 {
 			dtls = tpl.DTLSPort
 		}
@@ -233,8 +229,8 @@ func (a *App) issueCsqttAccess(ctx context.Context, chatID int64) {
 	if peer == 0 {
 		peer = dtls
 	}
-	link := csqtt.BuildLink(host, res.Password, peer, res.VKHashes)
-	a.log.Info("csqtt: access issued", "user", chatID, "name", name)
+	link := csqtt.BuildLink(host, res.Password, peer, "")
+	a.log.Info("csqtt: access issued (no vk hashes)", "user", chatID, "name", name)
 	a.sendCsqttReady(cctx, chatID, res.Password, link, res.Expires, false)
 }
 

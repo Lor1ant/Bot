@@ -1244,7 +1244,7 @@ var en = map[string]string{
 		"Template client: %s\n" +
 		"Access lifetime: %s\n" +
 		"Link host: %s\n\n" +
-		"How it works: the user taps «Get access» in the main menu → the bot creates client <code>tg_&lt;id&gt;</code> in the panel (vk_hashes and ports are copied from the template) → sends the password and the <code>csqtt://</code> link to the chat. Tapping again returns the live access.",
+		"How it works: the user taps «Get access» in the main menu → the bot creates client <code>tg_&lt;id&gt;</code> in the panel (ports are copied from the template, VK hashes stay empty — the user enters them in the app) → sends the password and the <code>csqtt://</code> link to the chat. Tapping again returns the live access.",
 	"csqtt.days_inf": "unlimited",
 	"csqtt.days_n":   "%d days",
 	"csqtt.btn_url":   "🔗 Panel URL",
@@ -1257,7 +1257,7 @@ var en = map[string]string{
 	"csqtt.ask_url":   "🔗 Send the CSQTT panel base URL (e.g. <code>https://panel.example.com:8443</code>), or «-» to clear.",
 	"csqtt.ask_login": "👤 Send the CSQTT panel login, or «-» to clear.",
 	"csqtt.ask_pass":  "🔑 Send the CSQTT panel password, or «-» to clear.",
-	"csqtt.ask_tpl":   "📋 Send the template client name in the CSQTT panel (its vk_hashes and ports are copied to the new access). Empty/«-» means: use the first client as the sample.",
+	"csqtt.ask_tpl":   "📋 Send the template client name in the CSQTT panel (its ports are copied to the new access; VK hashes are not copied — the user enters them in the app). Empty/«-» means: use the first client as the ports sample.",
 	"csqtt.ask_days":  "⏳ How many days should access last? A number 0..3650 (0 = unlimited).",
 	"csqtt.ask_host":  "🌐 Send the public host for the <code>csqtt://</code> link (e.g. <code>vpn.example.com</code>). Empty/«-» means: take the host from the panel URL.",
 	"csqtt.bad_days":  "❌ A number 0..3650 is required (0 = unlimited).",
